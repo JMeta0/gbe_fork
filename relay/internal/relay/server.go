@@ -346,8 +346,16 @@ func (s *Server) registerClient(conn net.Conn, env protocol.Envelope) (*client, 
 	created := false
 
 	s.mu.Lock()
+	bound := s.lookupClientByConnLocked(conn)
 	current := s.byPrimary[key]
-	if current != nil && current.tcpConn != conn {
+	if bound != nil {
+		// A re-registration on the same TCP session should update the existing client
+		// instead of creating a second client that then replaces the first.
+		if current != nil && current != bound {
+			replaced = append(replaced, current)
+		}
+		current = bound
+	} else if current != nil && current.tcpConn != conn {
 		replaced = append(replaced, current)
 		current = nil
 	}
@@ -366,6 +374,15 @@ func (s *Server) registerClient(conn net.Conn, env protocol.Envelope) (*client, 
 		s.clients[current] = struct{}{}
 	}
 	sendWelcome = sendWelcome || created
+
+	oldPrimaryKey := steamKey(current.appID, current.primaryID)
+	oldEndpointKey := endpointKey{appID: current.appID, ip: current.virtualIP, port: current.virtualPort}
+	if owner, ok := s.byPrimary[oldPrimaryKey]; ok && owner == current && oldPrimaryKey != key {
+		delete(s.byPrimary, oldPrimaryKey)
+	}
+	if owner, ok := s.byEndpoint[oldEndpointKey]; ok && owner == current {
+		delete(s.byEndpoint, oldEndpointKey)
+	}
 
 	for id := range current.listenIDs {
 		if owner, ok := s.bySteamID[steamKey(current.appID, id)]; ok && owner == current {
@@ -428,7 +445,7 @@ func (s *Server) registerClient(conn net.Conn, env protocol.Envelope) (*client, 
 		"listen_port", current.listenPort,
 		"virtual_endpoint", formatVirtualEndpoint(current.virtualIP, current.virtualPort),
 		"welcome_sent", sendWelcome,
-		"app_clients", s.appClientIDs(current.appID),
+		"app_clients", s.appClientSummaries(current.appID),
 		"shared_ids", s.sharedListenIDs(current.appID),
 	)
 	return current, nil
@@ -452,7 +469,7 @@ func (s *Server) routeEnvelope(sender *client, env protocol.Envelope, reliable b
 			s.deliver(target, env, false)
 			recipients++
 		}
-		s.logger.Info("broadcast routed", "appid", sender.appID, "source_id", env.SourceID, "payload_bytes", len(env.Payload), "recipients", recipients, "app_clients", s.appClientIDs(sender.appID), "shared_ids", s.sharedListenIDs(sender.appID))
+		s.logger.Info("broadcast routed", "appid", sender.appID, "source_id", env.SourceID, "payload_bytes", len(env.Payload), "recipients", recipients, "app_clients", s.appClientSummaries(sender.appID), "shared_ids", s.sharedListenIDs(sender.appID))
 		return
 	}
 
@@ -615,6 +632,38 @@ func (s *Server) appClientIDs(appID uint32) []uint64 {
 	return out
 }
 
+func (s *Server) appClientSummaries(appID uint32) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]string, 0, len(s.clients))
+	for c := range s.clients {
+		if c.appID != appID {
+			continue
+		}
+
+		tcpRemote := ""
+		if c.tcpConn != nil {
+			tcpRemote = c.tcpConn.RemoteAddr().String()
+		}
+
+		udpRemote := ""
+		if c.udpAddr.IsValid() {
+			udpRemote = c.udpAddr.String()
+		}
+
+		out = append(out, fmt.Sprintf(
+			"steam_id=%d virtual=%s tcp=%s udp=%s",
+			c.primaryID,
+			formatVirtualEndpoint(c.virtualIP, c.virtualPort),
+			tcpRemote,
+			udpRemote,
+		))
+	}
+	slices.Sort(out)
+	return out
+}
+
 func (s *Server) sharedListenIDs(appID uint32) []uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -640,6 +689,10 @@ func (s *Server) sharedListenIDs(appID uint32) []uint64 {
 func (s *Server) lookupClientByConn(conn net.Conn) *client {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.lookupClientByConnLocked(conn)
+}
+
+func (s *Server) lookupClientByConnLocked(conn net.Conn) *client {
 	for c := range s.clients {
 		if c.tcpConn == conn {
 			return c

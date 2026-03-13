@@ -777,6 +777,16 @@ void Networking::trigger_relay_rediscovery(const char *reason)
 
 bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
 {
+    if (!msg || !msg->source_id()) {
+        return false;
+    }
+
+    CSteamID source_id((uint64)msg->source_id());
+    if (std::find(ids.begin(), ids.end(), source_id) != ids.end()) {
+        PRINT_DEBUG("ignoring self announce from %llu", (uint64)msg->source_id());
+        return true;
+    }
+
     Connection *conn = find_connection((uint64)msg->source_id(), msg->announce().appid());
     if (!conn || conn->appid != msg->announce().appid()) {
         conn = new_connection((uint64)msg->source_id(), msg->announce().appid());
@@ -798,6 +808,7 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
         auto id_temp = std::find(ids.begin(), ids.end(), search_id);
         if (id_temp != ids.end()) {
             own_ip = ntohl(msg->announce().peers(i).ip());
+            continue;
         }
 
         Connection *conn = find_connection((uint64)msg->announce().peers(i).id(), msg->announce().peers(i).appid());

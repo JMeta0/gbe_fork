@@ -1,5 +1,9 @@
 #include "dll/relay_transport.h"
 
+#if defined(STEAM_WIN32) && !defined(SIO_UDP_CONNRESET)
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+
 namespace {
 constexpr uint32 RELAY_MAGIC = 0x4C524247; // GBRL
 constexpr uint16 RELAY_VERSION = 1;
@@ -66,6 +70,58 @@ static bool relay_last_error_is_would_block()
     return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS || err == WSAEALREADY;
 #else
     return errno == EWOULDBLOCK || errno == EAGAIN || errno == EINPROGRESS || errno == EALREADY;
+#endif
+}
+
+static int relay_get_last_error()
+{
+#if defined(STEAM_WIN32)
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+static const char *relay_socket_error_name(int err)
+{
+#if defined(STEAM_WIN32)
+    switch (err) {
+    case 0: return "ok";
+    case WSAEWOULDBLOCK: return "WSAEWOULDBLOCK";
+    case WSAEINPROGRESS: return "WSAEINPROGRESS";
+    case WSAEALREADY: return "WSAEALREADY";
+    case WSAECONNRESET: return "WSAECONNRESET";
+    case WSAECONNREFUSED: return "WSAECONNREFUSED";
+    case WSAENETRESET: return "WSAENETRESET";
+    case WSAENETUNREACH: return "WSAENETUNREACH";
+    case WSAETIMEDOUT: return "WSAETIMEDOUT";
+    default: return "WSA_UNKNOWN";
+    }
+#else
+    switch (err) {
+    case 0: return "ok";
+    case EWOULDBLOCK: return "EWOULDBLOCK";
+    case EAGAIN: return "EAGAIN";
+    case EINPROGRESS: return "EINPROGRESS";
+    case EALREADY: return "EALREADY";
+    case ECONNRESET: return "ECONNRESET";
+    case ECONNREFUSED: return "ECONNREFUSED";
+    case ENETRESET: return "ENETRESET";
+    case ENETUNREACH: return "ENETUNREACH";
+    case ETIMEDOUT: return "ETIMEDOUT";
+    default: return "ERR_UNKNOWN";
+    }
+#endif
+}
+
+static bool relay_last_error_is_udp_ignorable()
+{
+#if defined(STEAM_WIN32)
+    int err = WSAGetLastError();
+    return err == WSAECONNRESET || err == WSAECONNREFUSED || err == WSAENETRESET;
+#else
+    int err = errno;
+    return err == ECONNRESET || err == ECONNREFUSED || err == ENETRESET;
 #endif
 }
 
@@ -300,8 +356,29 @@ bool Relay_Transport::open_udp_locked(const sockaddr_in &addr)
         return false;
     }
 
+#if defined(STEAM_WIN32)
+    // Prevent ICMP port unreachable from turning into fatal recv errors on the
+    // connected UDP socket. That behavior causes needless full-session reconnects.
+    DWORD bytes_returned = 0;
+    BOOL new_behavior = FALSE;
+    if (WSAIoctl(
+            udp_socket,
+            SIO_UDP_CONNRESET,
+            &new_behavior,
+            sizeof(new_behavior),
+            nullptr,
+            0,
+            &bytes_returned,
+            nullptr,
+            nullptr) != 0) {
+        int err = relay_get_last_error();
+        PRINT_DEBUG("relay udp disable connreset failed err=%d name=%s", err, relay_socket_error_name(err));
+    }
+#endif
+
     if (connect(udp_socket, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0 && !relay_last_error_is_would_block()) {
-        PRINT_DEBUG("relay udp connect failed");
+        int err = relay_get_last_error();
+        PRINT_DEBUG("relay udp connect failed err=%d name=%s", err, relay_socket_error_name(err));
         relay_close_socket(udp_socket);
         return false;
     }
@@ -336,7 +413,8 @@ bool Relay_Transport::open_tcp_locked(const sockaddr_in &addr)
     }
 
     if (!relay_last_error_is_would_block()) {
-        PRINT_DEBUG("relay tcp connect failed immediately");
+        int err = relay_get_last_error();
+        PRINT_DEBUG("relay tcp connect failed immediately err=%d name=%s", err, relay_socket_error_name(err));
         relay_close_socket(tcp_socket);
         return false;
     }
@@ -358,6 +436,8 @@ bool Relay_Transport::finish_tcp_connect_locked()
     int res = select(static_cast<int>(tcp_socket + 1), nullptr, &writefds, nullptr, &timeout);
     if (res == 0) return false;
     if (res < 0) {
+        int err = relay_get_last_error();
+        PRINT_DEBUG("relay tcp connect select failed err=%d name=%s", err, relay_socket_error_name(err));
         schedule_reconnect_locked();
         return false;
     }
@@ -429,7 +509,8 @@ void Relay_Transport::flush_tcp_send_locked()
             continue;
         }
         if (sent == 0 || !relay_last_error_is_would_block()) {
-            PRINT_DEBUG("relay tcp send failed");
+            int err = relay_get_last_error();
+            PRINT_DEBUG("relay tcp send failed err=%d name=%s", err, relay_socket_error_name(err));
             schedule_reconnect_locked();
         }
         return;
@@ -512,7 +593,8 @@ void Relay_Transport::read_tcp_locked()
         }
 
         if (!relay_last_error_is_would_block()) {
-            PRINT_DEBUG("relay tcp recv failed");
+            int err = relay_get_last_error();
+            PRINT_DEBUG("relay tcp recv failed err=%d name=%s", err, relay_socket_error_name(err));
             schedule_reconnect_locked();
         }
         break;
@@ -550,8 +632,14 @@ void Relay_Transport::read_udp_locked()
         }
 
         if (received == 0) return;
+        if (relay_last_error_is_udp_ignorable()) {
+            int err = relay_get_last_error();
+            PRINT_DEBUG("relay udp recv ignored err=%d name=%s", err, relay_socket_error_name(err));
+            return;
+        }
         if (!relay_last_error_is_would_block()) {
-            PRINT_DEBUG("relay udp recv failed");
+            int err = relay_get_last_error();
+            PRINT_DEBUG("relay udp recv failed err=%d name=%s", err, relay_socket_error_name(err));
             schedule_reconnect_locked();
         }
         return;
@@ -608,8 +696,14 @@ bool Relay_Transport::send_udp_message_locked(uint16 type, uint32 flags, uint64 
         PRINT_DEBUG("relay udp partial send type=%s sent=%d expected=%zu", relay_msg_name(type), sent, bytes.size());
         return false;
     }
+    if (relay_last_error_is_udp_ignorable()) {
+        int err = relay_get_last_error();
+        PRINT_DEBUG("relay udp send ignored err=%d name=%s", err, relay_socket_error_name(err));
+        return false;
+    }
     if (!relay_last_error_is_would_block()) {
-        PRINT_DEBUG("relay udp send failed");
+        int err = relay_get_last_error();
+        PRINT_DEBUG("relay udp send failed err=%d name=%s", err, relay_socket_error_name(err));
         schedule_reconnect_locked();
     }
     return false;

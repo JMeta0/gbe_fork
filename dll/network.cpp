@@ -691,7 +691,7 @@ void Networking::relay_mark_peer_online(Common_Message *msg, IP_PORT ip_port)
     }
 }
 
-void Networking::relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids)
+void Networking::relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 disconnected_ip, uint16 disconnected_port)
 {
     if (peer_ids.empty()) return;
 
@@ -708,6 +708,23 @@ void Networking::relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids)
         if (!matched) {
             ++conn;
             continue;
+        }
+
+        if (disconnected_ip != 0 && disconnected_port != 0 &&
+            conn->tcp_ip_port.ip != 0 && conn->tcp_ip_port.port != 0) {
+            uint32 current_ip = ntohl(conn->tcp_ip_port.ip);
+            uint16 current_port = ntohs(conn->tcp_ip_port.port);
+            if (current_ip != disconnected_ip || current_port != disconnected_port) {
+                PRINT_DEBUG(
+                    "ignoring stale relay disconnect for ids=%zu disconnected=%u:%u current=%u:%u",
+                    peer_ids.size(),
+                    disconnected_ip,
+                    disconnected_port,
+                    current_ip,
+                    current_port);
+                ++conn;
+                continue;
+            }
         }
 
         if (conn->connected) {
@@ -732,7 +749,7 @@ void Networking::relay_dispatch_messages()
     uint32 disconnected_ip = 0;
     uint16 disconnected_port = 0;
     while (relay_transport->PollDisconnect(disconnected_ids, disconnected_ip, disconnected_port)) {
-        relay_mark_peer_offline(disconnected_ids);
+        relay_mark_peer_offline(disconnected_ids, disconnected_ip, disconnected_port);
     }
 
     Common_Message msg{};

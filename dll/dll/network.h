@@ -127,7 +127,7 @@ class Networking
     struct Connection *new_connection(CSteamID id, uint32 appid);
     struct Connection *find_or_create_connection(CSteamID id, uint32 appid);
     void relay_mark_peer_online(Common_Message *msg, IP_PORT ip_port);
-    void relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids);
+    void relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 virtual_ip, uint16 virtual_port);
     void relay_dispatch_messages();
     void trigger_relay_rediscovery(const char *reason);
 

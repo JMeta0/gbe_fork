@@ -14,6 +14,8 @@ constexpr uint16 RELAY_MSG_HEARTBEAT = 4;
 constexpr uint16 RELAY_MSG_RELIABLE = 5;
 constexpr uint16 RELAY_MSG_UNRELIABLE = 6;
 constexpr uint16 RELAY_MSG_DISCONNECT = 7;
+constexpr int RELAY_TCP_ACTIVITY_TIMEOUT_SECONDS = 30;
+constexpr int RELAY_UDP_ACTIVITY_TIMEOUT_SECONDS = 15;
 
 constexpr uint32 RELAY_FLAG_BROADCAST = 1u << 0;
 constexpr uint32 RELAY_FLAG_HAS_DEST_STEAMID = 1u << 1;
@@ -278,6 +280,8 @@ Relay_Transport::Relay_Transport(const std::string &host, uint16 tcp_port, uint1
     }
     last_tcp_heartbeat = std::chrono::steady_clock::now();
     last_udp_heartbeat = std::chrono::steady_clock::now();
+    last_tcp_receive = std::chrono::steady_clock::now();
+    last_udp_receive = std::chrono::steady_clock::now();
     next_connect_attempt = std::chrono::steady_clock::now();
 }
 
@@ -308,6 +312,8 @@ void Relay_Transport::schedule_reconnect_locked(std::chrono::seconds delay)
     session_token = 0;
     assigned_virtual_ip = 0;
     assigned_virtual_port = 0;
+    last_tcp_receive = std::chrono::steady_clock::now();
+    last_udp_receive = std::chrono::steady_clock::now();
 }
 
 void Relay_Transport::disconnect_locked()
@@ -533,11 +539,18 @@ void Relay_Transport::handle_incoming_locked(const std::vector<char> &packet, bo
         assigned_virtual_ip = env.source_virtual_ip;
         assigned_virtual_port = env.source_virtual_port ? env.source_virtual_port : listen_port;
         registration_dirty = true;
+        last_tcp_receive = std::chrono::steady_clock::now();
+        last_udp_receive = std::chrono::steady_clock::now();
         PRINT_DEBUG("relay welcome received virtual_ip=%u virtual_port=%u token=%llu", assigned_virtual_ip, assigned_virtual_port, static_cast<unsigned long long>(session_token));
         return;
     }
 
     if (env.type == RELAY_MSG_HEARTBEAT) {
+        if (reliable) {
+            last_tcp_receive = std::chrono::steady_clock::now();
+        } else {
+            last_udp_receive = std::chrono::steady_clock::now();
+        }
         return;
     }
 
@@ -571,6 +584,11 @@ void Relay_Transport::handle_incoming_locked(const std::vector<char> &packet, bo
     inbound.ip_port.ip = htonl(env.source_virtual_ip);
     inbound.ip_port.port = htons(env.source_virtual_port);
     inbound.reliable = reliable;
+    if (reliable) {
+        last_tcp_receive = std::chrono::steady_clock::now();
+    } else {
+        last_udp_receive = std::chrono::steady_clock::now();
+    }
     inbound_packets.push(std::move(inbound));
 }
 
@@ -770,6 +788,21 @@ void Relay_Transport::Run()
     flush_tcp_send_locked();
     read_tcp_locked();
     read_udp_locked();
+
+    auto now = std::chrono::steady_clock::now();
+    if (welcomed &&
+        std::chrono::duration_cast<std::chrono::seconds>(now - last_tcp_receive).count() >= RELAY_TCP_ACTIVITY_TIMEOUT_SECONDS) {
+        PRINT_DEBUG("relay tcp receive timeout");
+        schedule_reconnect_locked();
+        return;
+    }
+    if (welcomed &&
+        std::chrono::duration_cast<std::chrono::seconds>(now - last_udp_receive).count() >= RELAY_UDP_ACTIVITY_TIMEOUT_SECONDS) {
+        PRINT_DEBUG("relay udp receive timeout");
+        schedule_reconnect_locked();
+        return;
+    }
+
     send_periodic_heartbeats_locked();
     flush_tcp_send_locked();
 }

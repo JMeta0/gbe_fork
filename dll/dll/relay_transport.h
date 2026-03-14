@@ -40,6 +40,8 @@ class Relay_Transport
     std::queue<DisconnectEvent> disconnect_events{};
     std::chrono::steady_clock::time_point last_tcp_heartbeat{};
     std::chrono::steady_clock::time_point last_udp_heartbeat{};
+    std::chrono::steady_clock::time_point last_tcp_receive{};
+    std::chrono::steady_clock::time_point last_udp_receive{};
     std::chrono::steady_clock::time_point next_connect_attempt{};
     std::recursive_mutex mutex{};
 

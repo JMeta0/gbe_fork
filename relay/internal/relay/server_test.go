@@ -115,6 +115,120 @@ func TestServerRoutesTrafficAndDisconnects(t *testing.T) {
 	}
 }
 
+func TestServerReplacesSessionAndRoutesToNewestClient(t *testing.T) {
+	tcpPort := freeTCPPort(t)
+	udpPort := freeUDPPort(t)
+
+	cfg := config.Default()
+	cfg.ListenAddress = "127.0.0.1"
+	cfg.TCPPort = tcpPort
+	cfg.UDPPort = udpPort
+	cfg.SessionTimeout = 30 * time.Second
+	cfg.CleanupInterval = 500 * time.Millisecond
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := NewServer(cfg, logger)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = server.Run(ctx)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	watcher := connectClient(t, tcpPort, udpPort, 480, 2001)
+	defer watcher.tcp.Close()
+	defer watcher.udp.Close()
+
+	original := connectClient(t, tcpPort, udpPort, 480, 1001)
+	defer original.udp.Close()
+
+	replacement := connectClient(t, tcpPort, udpPort, 480, 1001)
+	defer replacement.tcp.Close()
+	defer replacement.udp.Close()
+
+	gotDisconnect := readTCPEnvelope(t, watcher.tcp)
+	if gotDisconnect.Type != protocol.MsgDisconnect {
+		t.Fatalf("expected disconnect for replaced client, got %+v", gotDisconnect)
+	}
+	_, ids, err := protocol.DecodeIDsPayload(gotDisconnect.Payload)
+	if err != nil {
+		t.Fatalf("decode disconnect payload: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != replacement.id {
+		t.Fatalf("unexpected disconnect ids: %v", ids)
+	}
+
+	broadcastPayload := []byte("replacement-broadcast")
+	sendUDPEnvelope(t, replacement.udp, protocol.Envelope{
+		Type:         protocol.MsgUnreliable,
+		Flags:        protocol.FlagBroadcast,
+		AppID:        480,
+		SourceID:     replacement.id,
+		SessionToken: replacement.token,
+		Payload:      broadcastPayload,
+	})
+	gotBroadcast := readUDPEnvelope(t, watcher.udp)
+	if gotBroadcast.Type != protocol.MsgUnreliable || string(gotBroadcast.Payload) != string(broadcastPayload) {
+		t.Fatalf("unexpected broadcast from replacement: %+v", gotBroadcast)
+	}
+
+	if replacement.vIP == original.vIP && replacement.vPort == original.vPort {
+		t.Fatalf("expected replacement session to get a new virtual endpoint")
+	}
+}
+
+func TestServerEchoesHeartbeats(t *testing.T) {
+	tcpPort := freeTCPPort(t)
+	udpPort := freeUDPPort(t)
+
+	cfg := config.Default()
+	cfg.ListenAddress = "127.0.0.1"
+	cfg.TCPPort = tcpPort
+	cfg.UDPPort = udpPort
+	cfg.SessionTimeout = 30 * time.Second
+	cfg.CleanupInterval = 500 * time.Millisecond
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := NewServer(cfg, logger)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = server.Run(ctx)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	client := connectClient(t, tcpPort, udpPort, 480, 1001)
+	defer client.tcp.Close()
+	defer client.udp.Close()
+
+	sendTCPEnvelope(t, client.tcp, protocol.Envelope{
+		Type:  protocol.MsgHeartbeat,
+		AppID: 480,
+	})
+	gotTCPHeartbeat := readTCPEnvelope(t, client.tcp)
+	if gotTCPHeartbeat.Type != protocol.MsgHeartbeat {
+		t.Fatalf("expected tcp heartbeat echo, got %+v", gotTCPHeartbeat)
+	}
+
+	sendUDPEnvelope(t, client.udp, protocol.Envelope{
+		Type:         protocol.MsgHeartbeat,
+		AppID:        480,
+		SessionToken: client.token,
+	})
+	gotUDPHeartbeat := readUDPEnvelope(t, client.udp)
+	if gotUDPHeartbeat.Type != protocol.MsgHeartbeat {
+		t.Fatalf("expected udp heartbeat echo, got %+v", gotUDPHeartbeat)
+	}
+}
+
 func connectClient(t *testing.T, tcpPort, udpPort int, appID uint32, id uint64) testClient {
 	t.Helper()
 
@@ -137,7 +251,7 @@ func connectClient(t *testing.T, tcpPort, udpPort int, appID uint32, id uint64) 
 		SourceID: id,
 		Payload:  protocol.EncodeIDsPayload(47584, []uint64{id}),
 	})
-	welcome := readTCPEnvelope(t, tcpConn)
+	welcome := readTCPEnvelopeUntil(t, tcpConn, protocol.MsgWelcome)
 	if welcome.Type != protocol.MsgWelcome {
 		t.Fatalf("expected welcome, got %+v", welcome)
 	}
@@ -148,6 +262,10 @@ func connectClient(t *testing.T, tcpPort, udpPort int, appID uint32, id uint64) 
 		SourceID:     id,
 		SessionToken: welcome.SessionToken,
 	})
+	gotHeartbeat := readUDPEnvelope(t, udpConn)
+	if gotHeartbeat.Type != protocol.MsgHeartbeat {
+		t.Fatalf("expected udp heartbeat echo during connect, got %+v", gotHeartbeat)
+	}
 
 	return testClient{
 		tcp:   tcpConn,
@@ -200,6 +318,20 @@ func readTCPEnvelope(t *testing.T, conn net.Conn) protocol.Envelope {
 		t.Fatalf("decode tcp envelope: %v", err)
 	}
 	return env
+}
+
+func readTCPEnvelopeUntil(t *testing.T, conn net.Conn, want uint16) protocol.Envelope {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for tcp envelope type %d", want)
+		}
+		env := readTCPEnvelope(t, conn)
+		if env.Type == want {
+			return env
+		}
+	}
 }
 
 func readUDPEnvelope(t *testing.T, conn *net.UDPConn) protocol.Envelope {

@@ -228,6 +228,13 @@ func (s *Server) handleTCPEnvelope(conn net.Conn, env protocol.Envelope) (*clien
 		client := s.lookupClientByConn(conn)
 		if client != nil {
 			s.touchClient(client, time.Now())
+			heartbeat := protocol.Envelope{
+				Type:  protocol.MsgHeartbeat,
+				AppID: client.appID,
+			}
+			if err := s.sendTCP(client, heartbeat); err != nil {
+				return client, err
+			}
 		}
 		return client, nil
 	case protocol.MsgReliable:
@@ -286,6 +293,11 @@ func (s *Server) udpLoop(ctx context.Context) error {
 
 		switch env.Type {
 		case protocol.MsgHeartbeat:
+			heartbeat := protocol.Envelope{
+				Type:  protocol.MsgHeartbeat,
+				AppID: client.appID,
+			}
+			_ = s.sendUDP(client, heartbeat)
 		case protocol.MsgUnreliable:
 			s.routeEnvelope(client, env, false)
 		}

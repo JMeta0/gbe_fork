@@ -35,6 +35,10 @@ struct ServerState {
     by_endpoint: HashMap<EndpointKey, u64>,
     next_ip: u32,
     next_client_id: u64,
+    reliable_routed: usize,
+    unreliable_routed: usize,
+    broadcast_routed: usize,
+    routed_bytes: usize,
 }
 
 struct Client {
@@ -112,6 +116,10 @@ impl Server {
                 by_endpoint: HashMap::new(),
                 next_ip: 1,
                 next_client_id: 1,
+                reliable_routed: 0,
+                unreliable_routed: 0,
+                broadcast_routed: 0,
+                routed_bytes: 0,
             })),
             tcp_listener: Arc::new(tcp_listener),
             udp_socket: Arc::new(udp_socket),
@@ -132,12 +140,6 @@ impl Server {
         let cleanup_shutdown = Arc::clone(&shutdown);
         let cleanup_thread = thread::spawn(move || cleanup_server.cleanup_loop(cleanup_shutdown));
 
-        info!(
-            tcp_port = self.cfg.tcp_port,
-            udp_port = self.cfg.udp_port,
-            "relay listening"
-        );
-
         accept_thread.join().unwrap()?;
         udp_thread.join().unwrap()?;
         cleanup_thread.join().unwrap()?;
@@ -147,8 +149,7 @@ impl Server {
     fn accept_loop(&self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         while !shutdown.load(Ordering::SeqCst) {
             match self.tcp_listener.accept() {
-                Ok((stream, remote)) => {
-                    info!(remote = %remote, "tcp client accepted");
+                Ok((stream, _remote)) => {
                     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                     let server = self.clone();
                     let child_shutdown = Arc::clone(&shutdown);
@@ -182,16 +183,6 @@ impl Server {
                                 continue;
                             }
                         };
-                        debug!(
-                            remote = ?remote,
-                            msg_type = env.msg_type,
-                            app_id = env.app_id,
-                            source_id = env.source_id,
-                            dest_id = env.dest_id,
-                            flags = env.flags,
-                            payload_bytes = env.payload.len(),
-                            "tcp frame received"
-                        );
                         match self.handle_tcp_envelope(&conn, env, bound_client) {
                             Ok(next) => bound_client = next,
                             Err(err) => {
@@ -269,16 +260,6 @@ impl Server {
                             continue;
                         }
                     };
-                    debug!(
-                        remote = %addr,
-                        msg_type = env.msg_type,
-                        app_id = env.app_id,
-                        source_id = env.source_id,
-                        dest_id = env.dest_id,
-                        flags = env.flags,
-                        payload_bytes = env.payload.len(),
-                        "udp frame received"
-                    );
 
                     let client_id = match self.lookup_client_by_token(env.session_token) {
                         Some(id) => id,
@@ -315,6 +296,8 @@ impl Server {
     }
 
     fn cleanup_loop(&self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
+        let mut next_info = Instant::now() + Duration::from_secs(60);
+        let mut next_debug = Instant::now() + Duration::from_secs(5);
         while !shutdown.load(Ordering::SeqCst) {
             thread::sleep(self.cfg.cleanup_interval);
             let now = Instant::now();
@@ -342,6 +325,15 @@ impl Server {
                 .checked_sub(self.cfg.session_timeout.saturating_mul(2))
                 .unwrap_or(now);
             self.limiter.cleanup(before);
+
+            if now >= next_info {
+                self.log_client_status();
+                next_info = now + Duration::from_secs(60);
+            }
+            if now >= next_debug {
+                self.flush_traffic_debug();
+                next_debug = now + Duration::from_secs(5);
+            }
         }
         Ok(())
     }
@@ -529,8 +521,9 @@ impl Server {
             primary_id,
             listen_ids = ?ids,
             listen_port,
-            welcome_sent = send_welcome,
-            "client registered"
+            virtual_endpoint = %self.client_snapshot(current_id).map(|c| format_virtual_endpoint(c.virtual_ip, c.virtual_port)).unwrap_or_else(|| "-".to_string()),
+            udp_remote = %self.client_udp_addr(current_id),
+            "client connected"
         );
 
         Ok(Some(current_id))
@@ -559,13 +552,7 @@ impl Server {
                     recipients += 1;
                 }
             }
-            info!(
-                app_id = sender.app_id,
-                source_id = env.source_id,
-                payload_bytes = env.payload.len(),
-                recipients,
-                "broadcast routed"
-            );
+            self.record_routed_packet(false, true, env.payload.len(), recipients);
             return;
         }
 
@@ -584,14 +571,7 @@ impl Server {
             return;
         };
 
-        info!(
-            app_id = sender.app_id,
-            source_id = env.source_id,
-            dest_id = self.client_snapshot(target_id).map(|c| c.primary_id).unwrap_or(0),
-            payload_bytes = env.payload.len(),
-            reliable,
-            "packet routed"
-        );
+        self.record_routed_packet(reliable, false, env.payload.len(), 1);
         self.deliver(target_id, env, reliable);
     }
 
@@ -714,7 +694,14 @@ impl Server {
         for peer_id in removed.notify {
             let _ = self.send_tcp(peer_id, disconnect.clone());
         }
-        info!(app_id = removed.app_id, steam_id = removed.primary_id, reason, "client removed");
+        info!(
+            app_id = removed.app_id,
+            primary_id = removed.primary_id,
+            listen_ids = ?removed.listen_ids,
+            virtual_endpoint = %format_virtual_endpoint(removed.virtual_ip, removed.virtual_port),
+            reason,
+            "client disconnected"
+        );
     }
 
     fn clients_for_app(&self, app_id: u32) -> Vec<u64> {
@@ -761,7 +748,7 @@ impl Server {
             data.udp_addr = Some(addr);
             data.last_seen = now;
             if first || changed {
-                info!(app_id = data.app_id, steam_id = data.primary_id, remote = %addr, "udp endpoint learned");
+                debug!(app_id = data.app_id, primary_id = data.primary_id, remote = %addr, "udp endpoint learned");
             }
         }
     }
@@ -787,6 +774,116 @@ impl Server {
             virtual_ip: data.virtual_ip,
             virtual_port: data.virtual_port,
         })
+    }
+
+    fn client_udp_addr(&self, client_id: u64) -> String {
+        let state = self.state.lock().unwrap();
+        let Some(client) = state.clients.get(&client_id) else {
+            return "-".to_string();
+        };
+        let data = client.data.lock().unwrap();
+        data.udp_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    fn record_routed_packet(
+        &self,
+        reliable: bool,
+        broadcast: bool,
+        payload_bytes: usize,
+        recipients: usize,
+    ) {
+        if recipients == 0 {
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if reliable {
+            state.reliable_routed += recipients;
+        } else {
+            state.unreliable_routed += recipients;
+        }
+        if broadcast {
+            state.broadcast_routed += 1;
+        }
+        state.routed_bytes += payload_bytes.saturating_mul(recipients);
+    }
+
+    fn flush_traffic_debug(&self) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+
+        let (active_clients, reliable, unreliable, broadcasts, bytes) = {
+            let mut state = self.state.lock().unwrap();
+            let active_clients = state.clients.len();
+            let reliable = state.reliable_routed;
+            let unreliable = state.unreliable_routed;
+            let broadcasts = state.broadcast_routed;
+            let bytes = state.routed_bytes;
+            state.reliable_routed = 0;
+            state.unreliable_routed = 0;
+            state.broadcast_routed = 0;
+            state.routed_bytes = 0;
+            (active_clients, reliable, unreliable, broadcasts, bytes)
+        };
+
+        if reliable == 0 && unreliable == 0 && broadcasts == 0 {
+            return;
+        }
+
+        debug!(
+            active_clients,
+            reliable_packets = reliable,
+            unreliable_packets = unreliable,
+            broadcast_packets = broadcasts,
+            delivered_bytes = bytes,
+            "traffic summary"
+        );
+    }
+
+    fn log_client_status(&self) {
+        let clients = self.client_status_lines();
+        if clients.is_empty() {
+            return;
+        }
+
+        info!(
+            connected = clients.len(),
+            clients = %clients.join(" | "),
+            "client status"
+        );
+    }
+
+    fn client_status_lines(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut lines = Vec::with_capacity(state.clients.len());
+        for client in state.clients.values() {
+            let data = client.data.lock().unwrap();
+            let tcp_remote = client
+                .stream
+                .lock()
+                .unwrap()
+                .peer_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| "-".to_string());
+            let udp_remote = data
+                .udp_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            lines.push(format!(
+                "app={} id={} ids={:?} virtual={} tcp={} udp={}",
+                data.app_id,
+                data.primary_id,
+                sorted_ids(&data.listen_ids),
+                format_virtual_endpoint(data.virtual_ip, data.virtual_port),
+                tcp_remote,
+                udp_remote
+            ));
+        }
+        lines.sort_unstable();
+        lines
     }
 }
 

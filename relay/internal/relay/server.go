@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +64,12 @@ type Server struct {
 	byToken    map[uint64]*client
 	byEndpoint map[endpointKey]*client
 	nextIP     uint32
+
+	statsMu           sync.Mutex
+	reliableRouted    int
+	unreliableRouted  int
+	broadcastRouted   int
+	routedBytes       int
 }
 
 func NewServer(cfg config.Config, logger *slog.Logger) (*Server, error) {
@@ -107,8 +114,6 @@ func (s *Server) Run(ctx context.Context) error {
 	go func() { errCh <- s.udpLoop(ctx) }()
 	go func() { errCh <- s.cleanupLoop(ctx) }()
 
-	s.logger.Info("relay listening", "tcp_port", s.cfg.TCPPort, "udp_port", s.cfg.UDPPort)
-
 	select {
 	case <-ctx.Done():
 		return nil
@@ -140,9 +145,6 @@ func (s *Server) acceptLoop(ctx context.Context) error {
 			return fmt.Errorf("accept tcp: %w", err)
 		}
 
-		if ra, ok := remoteAddrPort(conn.RemoteAddr()); ok {
-			s.logger.Info("tcp client accepted", "remote", ra.String())
-		}
 		go s.handleTCPConn(ctx, conn)
 	}
 }
@@ -156,10 +158,6 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 			_ = conn.Close()
 		}
 	}()
-
-	if ra, ok := remoteAddrPort(conn.RemoteAddr()); ok {
-		s.logger.Debug("tcp client connected", "remote", ra.String())
-	}
 
 	var buffer []byte
 	tmp := make([]byte, 4096)
@@ -184,7 +182,6 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 					s.logger.Warn("drop invalid tcp frame", "remote", conn.RemoteAddr().String(), "error", err)
 					continue
 				}
-				s.logger.Debug("tcp frame received", "remote", conn.RemoteAddr().String(), "type", env.Type, "appid", env.AppID, "source_id", env.SourceID, "dest_id", env.DestID, "flags", env.Flags, "payload_bytes", len(env.Payload))
 				next, err := s.handleTCPEnvelope(conn, env)
 				if err != nil {
 					s.logger.Warn("tcp envelope handling failed", "remote", conn.RemoteAddr().String(), "type", env.Type, "error", err)
@@ -282,8 +279,6 @@ func (s *Server) udpLoop(ctx context.Context) error {
 			s.logger.Warn("drop invalid udp frame", "remote", addr.String(), "error", err)
 			continue
 		}
-		s.logger.Debug("udp frame received", "remote", addr.String(), "type", env.Type, "appid", env.AppID, "source_id", env.SourceID, "dest_id", env.DestID, "flags", env.Flags, "payload_bytes", len(env.Payload))
-
 		client := s.lookupClientByToken(env.SessionToken)
 		if client == nil {
 			s.logger.Warn("udp packet with unknown token", "remote", addr.String(), "type", env.Type, "appid", env.AppID, "source_id", env.SourceID)
@@ -306,7 +301,11 @@ func (s *Server) udpLoop(ctx context.Context) error {
 
 func (s *Server) cleanupLoop(ctx context.Context) error {
 	ticker := time.NewTicker(s.cfg.CleanupInterval)
+	infoTicker := time.NewTicker(60 * time.Second)
+	debugTicker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	defer infoTicker.Stop()
+	defer debugTicker.Stop()
 
 	for {
 		select {
@@ -328,6 +327,10 @@ func (s *Server) cleanupLoop(ctx context.Context) error {
 			}
 
 			s.limiter.Cleanup(now.Add(-2 * s.cfg.SessionTimeout))
+		case <-infoTicker.C:
+			s.logClientStatus()
+		case <-debugTicker.C:
+			s.flushTrafficDebug()
 		}
 	}
 }
@@ -449,16 +452,14 @@ func (s *Server) registerClient(conn net.Conn, env protocol.Envelope) (*client, 
 		}
 	}
 	s.logger.Info(
-		"client registered",
+		"client connected",
 		"remote", conn.RemoteAddr().String(),
 		"appid", current.appID,
 		"primary_id", current.primaryID,
 		"listen_ids", current.idsSlice(),
 		"listen_port", current.listenPort,
 		"virtual_endpoint", formatVirtualEndpoint(current.virtualIP, current.virtualPort),
-		"welcome_sent", sendWelcome,
-		"app_clients", s.appClientSummaries(current.appID),
-		"shared_ids", s.sharedListenIDs(current.appID),
+		"udp_remote", udpAddrString(current.udpAddr),
 	)
 	return current, nil
 }
@@ -481,7 +482,7 @@ func (s *Server) routeEnvelope(sender *client, env protocol.Envelope, reliable b
 			s.deliver(target, env, false)
 			recipients++
 		}
-		s.logger.Info("broadcast routed", "appid", sender.appID, "source_id", env.SourceID, "payload_bytes", len(env.Payload), "recipients", recipients, "app_clients", s.appClientSummaries(sender.appID), "shared_ids", s.sharedListenIDs(sender.appID))
+		s.recordRoutedPacket(false, true, len(env.Payload), recipients)
 		return
 	}
 
@@ -498,15 +499,7 @@ func (s *Server) routeEnvelope(sender *client, env protocol.Envelope, reliable b
 		)
 		return
 	}
-	s.logger.Info(
-		"packet routed",
-		"appid", sender.appID,
-		"source_id", env.SourceID,
-		"dest_id", target.primaryID,
-		"dest_endpoint", formatVirtualEndpoint(target.virtualIP, target.virtualPort),
-		"payload_bytes", len(env.Payload),
-		"reliable", reliable,
-	)
+	s.recordRoutedPacket(reliable, false, len(env.Payload), 1)
 	s.deliver(target, env, reliable)
 }
 
@@ -616,7 +609,15 @@ func (s *Server) removeClient(target *client, reason string) {
 		_ = s.sendTCP(peer, disconnect)
 	}
 
-	s.logger.Info("client removed", "appid", target.appID, "steam_id", target.primaryID, "reason", reason)
+	s.logger.Info(
+		"client disconnected",
+		"appid", target.appID,
+		"primary_id", target.primaryID,
+		"listen_ids", target.idsSlice(),
+		"virtual_endpoint", formatVirtualEndpoint(target.virtualIP, target.virtualPort),
+		"udp_remote", udpAddrString(target.udpAddr),
+		"reason", reason,
+	)
 }
 
 func (s *Server) clientsForApp(appID uint32) []*client {
@@ -628,73 +629,6 @@ func (s *Server) clientsForApp(appID uint32) []*client {
 			out = append(out, c)
 		}
 	}
-	return out
-}
-
-func (s *Server) appClientIDs(appID uint32) []uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]uint64, 0, len(s.clients))
-	for c := range s.clients {
-		if c.appID == appID {
-			out = append(out, c.primaryID)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
-
-func (s *Server) appClientSummaries(appID uint32) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	out := make([]string, 0, len(s.clients))
-	for c := range s.clients {
-		if c.appID != appID {
-			continue
-		}
-
-		tcpRemote := ""
-		if c.tcpConn != nil {
-			tcpRemote = c.tcpConn.RemoteAddr().String()
-		}
-
-		udpRemote := ""
-		if c.udpAddr.IsValid() {
-			udpRemote = c.udpAddr.String()
-		}
-
-		out = append(out, fmt.Sprintf(
-			"steam_id=%d virtual=%s tcp=%s udp=%s",
-			c.primaryID,
-			formatVirtualEndpoint(c.virtualIP, c.virtualPort),
-			tcpRemote,
-			udpRemote,
-		))
-	}
-	slices.Sort(out)
-	return out
-}
-
-func (s *Server) sharedListenIDs(appID uint32) []uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	counts := make(map[uint64]int)
-	for c := range s.clients {
-		if c.appID != appID {
-			continue
-		}
-		for id := range c.listenIDs {
-			counts[id]++
-		}
-	}
-	out := make([]uint64, 0)
-	for id, count := range counts {
-		if count > 1 {
-			out = append(out, id)
-		}
-	}
-	slices.Sort(out)
 	return out
 }
 
@@ -739,7 +673,7 @@ func (s *Server) updateUDPAddr(c *client, addr netip.AddrPort, now time.Time) {
 	c.udpAddr = addr
 	c.lastSeen = now
 	if first || changed {
-		s.logger.Info("udp endpoint learned", "appid", c.appID, "steam_id", c.primaryID, "remote", addr.String())
+		s.logger.Debug("udp endpoint learned", "appid", c.appID, "primary_id", c.primaryID, "remote", addr.String())
 	}
 }
 
@@ -798,4 +732,103 @@ func formatVirtualEndpoint(ip uint32, port uint16) string {
 		byte(ip),
 	})
 	return netip.AddrPortFrom(addr, port).String()
+}
+
+func (s *Server) recordRoutedPacket(reliable bool, broadcast bool, payloadBytes int, recipients int) {
+	if recipients <= 0 {
+		return
+	}
+
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+
+	if reliable {
+		s.reliableRouted += recipients
+	} else {
+		s.unreliableRouted += recipients
+	}
+	if broadcast {
+		s.broadcastRouted++
+	}
+	s.routedBytes += payloadBytes * recipients
+}
+
+func (s *Server) flushTrafficDebug() {
+	if !s.logger.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+
+	s.statsMu.Lock()
+	reliable := s.reliableRouted
+	unreliable := s.unreliableRouted
+	broadcasts := s.broadcastRouted
+	bytes := s.routedBytes
+	s.reliableRouted = 0
+	s.unreliableRouted = 0
+	s.broadcastRouted = 0
+	s.routedBytes = 0
+	s.statsMu.Unlock()
+
+	if reliable == 0 && unreliable == 0 && broadcasts == 0 {
+		return
+	}
+
+	s.logger.Debug(
+		"traffic summary",
+		"active_clients", s.clientCount(),
+		"reliable_packets", reliable,
+		"unreliable_packets", unreliable,
+		"broadcast_packets", broadcasts,
+		"delivered_bytes", bytes,
+	)
+}
+
+func (s *Server) logClientStatus() {
+	clients := s.clientStatusLines()
+	if len(clients) == 0 {
+		return
+	}
+
+	s.logger.Info(
+		"client status",
+		"connected", len(clients),
+		"clients", strings.Join(clients, " | "),
+	)
+}
+
+func (s *Server) clientStatusLines() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	lines := make([]string, 0, len(s.clients))
+	for c := range s.clients {
+		tcpRemote := ""
+		if c.tcpConn != nil {
+			tcpRemote = c.tcpConn.RemoteAddr().String()
+		}
+		lines = append(lines, fmt.Sprintf(
+			"app=%d id=%d ids=%v virtual=%s tcp=%s udp=%s",
+			c.appID,
+			c.primaryID,
+			c.idsSlice(),
+			formatVirtualEndpoint(c.virtualIP, c.virtualPort),
+			tcpRemote,
+			udpAddrString(c.udpAddr),
+		))
+	}
+	slices.Sort(lines)
+	return lines
+}
+
+func (s *Server) clientCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.clients)
+}
+
+func udpAddrString(addr netip.AddrPort) string {
+	if !addr.IsValid() {
+		return "-"
+	}
+	return addr.String()
 }

@@ -181,6 +181,71 @@ func TestServerReplacesSessionAndRoutesToNewestClient(t *testing.T) {
 	}
 }
 
+func TestServerHintsDisconnectForStaleEndpointRoute(t *testing.T) {
+	tcpPort := freeTCPPort(t)
+	udpPort := freeUDPPort(t)
+
+	cfg := config.Default()
+	cfg.ListenAddress = "127.0.0.1"
+	cfg.TCPPort = tcpPort
+	cfg.UDPPort = udpPort
+	cfg.SessionTimeout = 30 * time.Second
+	cfg.CleanupInterval = 500 * time.Millisecond
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := NewServer(cfg, logger)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = server.Run(ctx)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	sender := connectClient(t, tcpPort, udpPort, 480, 1001)
+	defer sender.tcp.Close()
+	defer sender.udp.Close()
+
+	target := connectClient(t, tcpPort, udpPort, 480, 2001)
+	defer target.udp.Close()
+
+	_ = target.tcp.Close()
+	gotDisconnect := readTCPEnvelope(t, sender.tcp)
+	if gotDisconnect.Type != protocol.MsgDisconnect {
+		t.Fatalf("expected initial disconnect, got %+v", gotDisconnect)
+	}
+
+	stalePayload := []byte("stale-endpoint")
+	sendUDPEnvelope(t, sender.udp, protocol.Envelope{
+		Type:            protocol.MsgUnreliable,
+		Flags:           protocol.FlagHasDestEndpoint,
+		AppID:           480,
+		SourceID:        sender.id,
+		DestVirtualIP:   target.vIP,
+		DestVirtualPort: target.vPort,
+		SessionToken:    sender.token,
+		Payload:         stalePayload,
+	})
+
+	gotHint := readTCPEnvelopeUntil(t, sender.tcp, protocol.MsgDisconnect)
+	if gotHint.Type != protocol.MsgDisconnect {
+		t.Fatalf("expected stale-route disconnect hint, got %+v", gotHint)
+	}
+	if gotHint.SourceVirtualIP != target.vIP || gotHint.SourceVirtualPort != target.vPort {
+		t.Fatalf("unexpected stale-route disconnect endpoint: %+v", gotHint)
+	}
+	_, ids, err := protocol.DecodeIDsPayload(gotHint.Payload)
+	if err != nil {
+		t.Fatalf("decode stale-route disconnect payload: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != target.id {
+		t.Fatalf("unexpected stale-route disconnect ids: %v", ids)
+	}
+}
+
 func TestServerEchoesHeartbeats(t *testing.T) {
 	tcpPort := freeTCPPort(t)
 	udpPort := freeUDPPort(t)

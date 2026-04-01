@@ -14,7 +14,8 @@ use crate::config::Config;
 use crate::protocol::{
     decode_envelope, decode_ids_payload, encode_envelope, encode_ids_payload, frame_tcp,
     next_tcp_frame, Envelope, FLAG_BROADCAST, FLAG_HAS_DEST_ENDPOINT, FLAG_HAS_DEST_STEAM_ID,
-    MSG_HEARTBEAT, MSG_HELLO, MSG_REGISTER, MSG_RELIABLE, MSG_UNRELIABLE, MSG_WELCOME,
+    MSG_DISCONNECT, MSG_HEARTBEAT, MSG_HELLO, MSG_REGISTER, MSG_RELIABLE, MSG_UNRELIABLE,
+    MSG_WELCOME,
 };
 use crate::ratelimit::Limiter;
 
@@ -33,6 +34,8 @@ struct ServerState {
     by_steam_id: HashMap<String, u64>,
     by_token: HashMap<u64, u64>,
     by_endpoint: HashMap<EndpointKey, u64>,
+    stale_ids: HashMap<String, DisconnectHint>,
+    stale_endpoints: HashMap<EndpointKey, DisconnectHint>,
     next_ip: u32,
     next_client_id: u64,
     reliable_routed: usize,
@@ -98,6 +101,16 @@ struct RemovedClient {
     stream: Arc<Mutex<TcpStream>>,
 }
 
+#[derive(Clone)]
+struct DisconnectHint {
+    app_id: u32,
+    listen_port: u16,
+    listen_ids: Vec<u64>,
+    virtual_ip: u32,
+    virtual_port: u16,
+    expires_at: Instant,
+}
+
 impl Server {
     pub fn new(cfg: Config) -> io::Result<Self> {
         let tcp_listener = TcpListener::bind((cfg.listen_address.as_str(), cfg.tcp_port))?;
@@ -114,6 +127,8 @@ impl Server {
                 by_steam_id: HashMap::new(),
                 by_token: HashMap::new(),
                 by_endpoint: HashMap::new(),
+                stale_ids: HashMap::new(),
+                stale_endpoints: HashMap::new(),
                 next_ip: 1,
                 next_client_id: 1,
                 reliable_routed: 0,
@@ -321,6 +336,7 @@ impl Server {
                 self.remove_client(Some(client_id), "timeout");
             }
 
+            self.cleanup_disconnect_hints(now);
             let before = now
                 .checked_sub(self.cfg.session_timeout.saturating_mul(2))
                 .unwrap_or(now);
@@ -476,14 +492,16 @@ impl Server {
 
             state.by_primary.insert(key, client_id);
             state.by_token.insert(data.token, client_id);
-            state.by_endpoint.insert(
-                EndpointKey {
-                    app_id: data.app_id,
-                    ip: data.virtual_ip,
-                    port: data.virtual_port,
-                },
-                client_id,
-            );
+            let current_endpoint_key = EndpointKey {
+                app_id: data.app_id,
+                ip: data.virtual_ip,
+                port: data.virtual_port,
+            };
+            state.by_endpoint.insert(current_endpoint_key, client_id);
+            state.stale_endpoints.remove(&current_endpoint_key);
+            for id in &ids {
+                state.stale_ids.remove(&steam_key(data.app_id, *id));
+            }
             current_id = client_id;
         }
 
@@ -558,6 +576,7 @@ impl Server {
 
         let target_id = self.resolve_target(sender.app_id, &env);
         let Some(target_id) = target_id else {
+            self.maybe_send_disconnect_hint(sender_id, sender.app_id, &env);
             warn!(
                 app_id = sender.app_id,
                 source_id = env.source_id,
@@ -665,11 +684,31 @@ impl Server {
                 })
                 .collect();
 
+            let hint = DisconnectHint {
+                app_id: data.app_id,
+                listen_port: data.listen_port,
+                listen_ids: sorted_ids(&data.listen_ids),
+                virtual_ip: data.virtual_ip,
+                virtual_port: data.virtual_port,
+                expires_at: Instant::now() + self.cfg.session_timeout,
+            };
+            state.stale_endpoints.insert(
+                EndpointKey {
+                    app_id: hint.app_id,
+                    ip: hint.virtual_ip,
+                    port: hint.virtual_port,
+                },
+                hint.clone(),
+            );
+            for id in &hint.listen_ids {
+                state.stale_ids.insert(steam_key(hint.app_id, *id), hint.clone());
+            }
+
             RemovedClient {
                 app_id: data.app_id,
                 primary_id: data.primary_id,
                 listen_port: data.listen_port,
-                listen_ids: sorted_ids(&data.listen_ids),
+                listen_ids: hint.listen_ids.clone(),
                 virtual_ip: data.virtual_ip,
                 virtual_port: data.virtual_port,
                 notify,
@@ -679,7 +718,7 @@ impl Server {
 
         let _ = removed.stream.lock().unwrap().shutdown(Shutdown::Both);
         let disconnect = Envelope {
-            msg_type: crate::protocol::MSG_DISCONNECT,
+            msg_type: MSG_DISCONNECT,
             flags: 0,
             app_id: removed.app_id,
             source_id: removed.primary_id,
@@ -734,6 +773,55 @@ impl Server {
         None
     }
 
+    fn maybe_send_disconnect_hint(&self, sender_id: u64, app_id: u32, env: &Envelope) {
+        let hint = {
+            let state = self.state.lock().unwrap();
+            let now = Instant::now();
+            if env.flags & FLAG_HAS_DEST_STEAM_ID != 0 {
+                if let Some(hint) = state.stale_ids.get(&steam_key(app_id, env.dest_id)) {
+                    if now < hint.expires_at {
+                        Some(hint.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if env.flags & FLAG_HAS_DEST_ENDPOINT != 0 {
+                state
+                    .stale_endpoints
+                    .get(&EndpointKey {
+                        app_id,
+                        ip: env.dest_virtual_ip,
+                        port: env.dest_virtual_port,
+                    })
+                    .filter(|hint| now < hint.expires_at)
+                    .cloned()
+            } else {
+                None
+            }
+        };
+
+        let Some(hint) = hint else {
+            return;
+        };
+
+        let disconnect = Envelope {
+            msg_type: MSG_DISCONNECT,
+            flags: 0,
+            app_id: hint.app_id,
+            source_id: hint.listen_ids.first().copied().unwrap_or(0),
+            dest_id: 0,
+            source_virtual_ip: hint.virtual_ip,
+            source_virtual_port: hint.virtual_port,
+            dest_virtual_ip: 0,
+            dest_virtual_port: 0,
+            session_token: 0,
+            payload: encode_ids_payload(hint.listen_port, &hint.listen_ids),
+        };
+        let _ = self.send_tcp(sender_id, disconnect);
+    }
+
     fn lookup_client_by_token(&self, token: u64) -> Option<u64> {
         let state = self.state.lock().unwrap();
         state.by_token.get(&token).copied()
@@ -758,6 +846,14 @@ impl Server {
         if let Some(client) = state.clients.get(&client_id) {
             client.data.lock().unwrap().last_seen = now;
         }
+    }
+
+    fn cleanup_disconnect_hints(&self, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        state.stale_ids.retain(|_, hint| now < hint.expires_at);
+        state
+            .stale_endpoints
+            .retain(|_, hint| now < hint.expires_at);
     }
 
     fn client_app_id(&self, client_id: u64) -> Option<u32> {

@@ -41,6 +41,15 @@ type client struct {
 	closing     bool
 }
 
+type disconnectHint struct {
+	appID       uint32
+	listenPort  uint16
+	ids         []uint64
+	virtualIP   uint32
+	virtualPort uint16
+	expiresAt   time.Time
+}
+
 func (c *client) idsSlice() []uint64 {
 	ids := make([]uint64, 0, len(c.listenIDs))
 	for id := range c.listenIDs {
@@ -63,6 +72,8 @@ type Server struct {
 	bySteamID  map[string]*client
 	byToken    map[uint64]*client
 	byEndpoint map[endpointKey]*client
+	staleIDs   map[string]*disconnectHint
+	staleEPs   map[endpointKey]*disconnectHint
 	nextIP     uint32
 
 	statsMu           sync.Mutex
@@ -101,6 +112,8 @@ func NewServer(cfg config.Config, logger *slog.Logger) (*Server, error) {
 		bySteamID:  make(map[string]*client),
 		byToken:    make(map[uint64]*client),
 		byEndpoint: make(map[endpointKey]*client),
+		staleIDs:   make(map[string]*disconnectHint),
+		staleEPs:   make(map[endpointKey]*disconnectHint),
 		nextIP:     1,
 	}, nil
 }
@@ -326,6 +339,7 @@ func (s *Server) cleanupLoop(ctx context.Context) error {
 				s.removeClient(c, "timeout")
 			}
 
+			s.cleanupDisconnectHints(now)
 			s.limiter.Cleanup(now.Add(-2 * s.cfg.SessionTimeout))
 		case <-infoTicker.C:
 			s.logClientStatus()
@@ -429,7 +443,12 @@ func (s *Server) registerClient(conn net.Conn, env protocol.Envelope) (*client, 
 
 	s.byPrimary[key] = current
 	s.byToken[current.token] = current
-	s.byEndpoint[endpointKey{appID: current.appID, ip: current.virtualIP, port: current.virtualPort}] = current
+	currentEndpointKey := endpointKey{appID: current.appID, ip: current.virtualIP, port: current.virtualPort}
+	s.byEndpoint[currentEndpointKey] = current
+	delete(s.staleEPs, currentEndpointKey)
+	for _, id := range ids {
+		delete(s.staleIDs, steamKey(current.appID, id))
+	}
 	s.mu.Unlock()
 
 	for _, old := range replaced {
@@ -488,6 +507,7 @@ func (s *Server) routeEnvelope(sender *client, env protocol.Envelope, reliable b
 
 	target := s.resolveTarget(sender.appID, env)
 	if target == nil {
+		s.maybeSendDisconnectHint(sender, env)
 		s.logger.Warn(
 			"route target not found",
 			"appid", sender.appID,
@@ -589,7 +609,9 @@ func (s *Server) removeClient(target *client, reason string) {
 			notify = append(notify, client)
 		}
 	}
-	payload = protocol.EncodeIDsPayload(target.listenPort, target.idsSlice())
+	ids := target.idsSlice()
+	s.rememberDisconnectHintLocked(target, ids)
+	payload = protocol.EncodeIDsPayload(target.listenPort, ids)
 	tcpConn = target.tcpConn
 	s.mu.Unlock()
 
@@ -665,6 +687,42 @@ func (s *Server) lookupClientByEndpoint(appID uint32, ip uint32, port uint16) *c
 	return s.byEndpoint[endpointKey{appID: appID, ip: ip, port: port}]
 }
 
+func (s *Server) maybeSendDisconnectHint(sender *client, env protocol.Envelope) {
+	hint := s.lookupDisconnectHint(sender.appID, env)
+	if hint == nil {
+		return
+	}
+
+	disconnect := protocol.Envelope{
+		Type:              protocol.MsgDisconnect,
+		AppID:             hint.appID,
+		SourceID:          firstHintID(hint.ids),
+		SourceVirtualIP:   hint.virtualIP,
+		SourceVirtualPort: hint.virtualPort,
+		Payload:           protocol.EncodeIDsPayload(hint.listenPort, hint.ids),
+	}
+	_ = s.sendTCP(sender, disconnect)
+}
+
+func (s *Server) lookupDisconnectHint(appID uint32, env protocol.Envelope) *disconnectHint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+	if env.Flags&protocol.FlagHasDestSteamID != 0 {
+		if hint := s.staleIDs[steamKey(appID, env.DestID)]; hint != nil && now.Before(hint.expiresAt) {
+			return cloneDisconnectHint(hint)
+		}
+	}
+	if env.Flags&protocol.FlagHasDestEndpoint != 0 {
+		key := endpointKey{appID: appID, ip: env.DestVirtualIP, port: env.DestVirtualPort}
+		if hint := s.staleEPs[key]; hint != nil && now.Before(hint.expiresAt) {
+			return cloneDisconnectHint(hint)
+		}
+	}
+	return nil
+}
+
 func (s *Server) updateUDPAddr(c *client, addr netip.AddrPort, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -681,6 +739,37 @@ func (s *Server) touchClient(c *client, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c.lastSeen = now
+}
+
+func (s *Server) rememberDisconnectHintLocked(target *client, ids []uint64) {
+	hint := &disconnectHint{
+		appID:       target.appID,
+		listenPort:  target.listenPort,
+		ids:         append([]uint64(nil), ids...),
+		virtualIP:   target.virtualIP,
+		virtualPort: target.virtualPort,
+		expiresAt:   time.Now().Add(s.cfg.SessionTimeout),
+	}
+	s.staleEPs[endpointKey{appID: target.appID, ip: target.virtualIP, port: target.virtualPort}] = hint
+	for _, id := range ids {
+		s.staleIDs[steamKey(target.appID, id)] = hint
+	}
+}
+
+func (s *Server) cleanupDisconnectHints(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, hint := range s.staleIDs {
+		if hint == nil || !now.Before(hint.expiresAt) {
+			delete(s.staleIDs, key)
+		}
+	}
+	for key, hint := range s.staleEPs {
+		if hint == nil || !now.Before(hint.expiresAt) {
+			delete(s.staleEPs, key)
+		}
+	}
 }
 
 func (s *Server) allocateVirtualIPLocked() uint32 {
@@ -831,4 +920,25 @@ func udpAddrString(addr netip.AddrPort) string {
 		return "-"
 	}
 	return addr.String()
+}
+
+func cloneDisconnectHint(hint *disconnectHint) *disconnectHint {
+	if hint == nil {
+		return nil
+	}
+	return &disconnectHint{
+		appID:       hint.appID,
+		listenPort:  hint.listenPort,
+		ids:         append([]uint64(nil), hint.ids...),
+		virtualIP:   hint.virtualIP,
+		virtualPort: hint.virtualPort,
+		expiresAt:   hint.expiresAt,
+	}
+}
+
+func firstHintID(ids []uint64) uint64 {
+	if len(ids) == 0 {
+		return 0
+	}
+	return ids[0]
 }

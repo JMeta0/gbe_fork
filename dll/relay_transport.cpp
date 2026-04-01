@@ -71,7 +71,7 @@ static bool relay_last_error_is_would_block()
     int err = WSAGetLastError();
     return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS || err == WSAEALREADY;
 #else
-    return errno == EWOULDBLOCK || errno == EAGAIN || errno == EINPROGRESS || errno == EALREADY;
+    return errno == EWOULDBLOCK || errno == EINPROGRESS || errno == EALREADY;
 #endif
 }
 
@@ -103,7 +103,6 @@ static const char *relay_socket_error_name(int err)
     switch (err) {
     case 0: return "ok";
     case EWOULDBLOCK: return "EWOULDBLOCK";
-    case EAGAIN: return "EAGAIN";
     case EINPROGRESS: return "EINPROGRESS";
     case EALREADY: return "EALREADY";
     case ECONNRESET: return "ECONNRESET";

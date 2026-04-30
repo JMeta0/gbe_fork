@@ -264,6 +264,17 @@ static bool deserialize_ids_payload(const std::vector<char> &payload, std::vecto
     }
     return offset == payload.size();
 }
+
+static std::string relay_ids_string(const std::vector<CSteamID> &ids)
+{
+    std::string out = "[";
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i != 0) out += ", ";
+        out += std::to_string(ids[i].ConvertToUint64());
+    }
+    out += "]";
+    return out;
+}
 }
 
 Relay_Transport::Relay_Transport(const std::string &host, uint16 tcp_port, uint16 udp_port, uint16 listen_port, uint32 appid, CSteamID initial_id)
@@ -277,6 +288,7 @@ Relay_Transport::Relay_Transport(const std::string &host, uint16 tcp_port, uint1
     if (initial_id.IsValid()) {
         local_ids.push_back(initial_id);
     }
+    PRINT_DEBUG("relay transport initial ids=%s", relay_ids_string(local_ids).c_str());
     last_tcp_heartbeat = std::chrono::steady_clock::now();
     last_udp_heartbeat = std::chrono::steady_clock::now();
     last_tcp_receive = std::chrono::steady_clock::now();
@@ -303,7 +315,12 @@ bool Relay_Transport::ready()
 
 void Relay_Transport::schedule_reconnect_locked(std::chrono::seconds delay)
 {
-    PRINT_DEBUG("relay reconnect scheduled delay=%llds", static_cast<long long>(delay.count()));
+    schedule_reconnect_locked("unspecified", delay);
+}
+
+void Relay_Transport::schedule_reconnect_locked(const char *reason, std::chrono::seconds delay)
+{
+    PRINT_DEBUG("relay reconnect scheduled reason='%s' delay=%llds", reason ? reason : "?", static_cast<long long>(delay.count()));
     disconnect_locked();
     next_connect_attempt = std::chrono::steady_clock::now() + delay;
     hello_sent = false;
@@ -438,14 +455,14 @@ bool Relay_Transport::finish_tcp_connect_locked()
     FD_ZERO(&writefds);
     FD_SET(tcp_socket, &writefds);
     timeval timeout{};
-    int res = select(static_cast<int>(tcp_socket + 1), nullptr, &writefds, nullptr, &timeout);
-    if (res == 0) return false;
-    if (res < 0) {
-        int err = relay_get_last_error();
-        PRINT_DEBUG("relay tcp connect select failed err=%d name=%s", err, relay_socket_error_name(err));
-        schedule_reconnect_locked();
-        return false;
-    }
+        int res = select(static_cast<int>(tcp_socket + 1), nullptr, &writefds, nullptr, &timeout);
+        if (res == 0) return false;
+        if (res < 0) {
+            int err = relay_get_last_error();
+            PRINT_DEBUG("relay tcp connect select failed err=%d name=%s", err, relay_socket_error_name(err));
+            schedule_reconnect_locked("tcp connect select failed");
+            return false;
+        }
 
     int so_error = 0;
 #if defined(STEAM_WIN32)
@@ -455,7 +472,7 @@ bool Relay_Transport::finish_tcp_connect_locked()
 #endif
     if (getsockopt(tcp_socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&so_error), &len) != 0 || so_error != 0) {
         PRINT_DEBUG("relay tcp connect failed %i", so_error);
-        schedule_reconnect_locked();
+        schedule_reconnect_locked("tcp connect failed");
         return false;
     }
 
@@ -487,13 +504,13 @@ bool Relay_Transport::ensure_connected_locked()
     sockaddr_in tcp_addr{};
     sockaddr_in udp_addr{};
     if (!resolve_host_locked(tcp_addr, tcp_port) || !resolve_host_locked(udp_addr, udp_port)) {
-        schedule_reconnect_locked(std::chrono::seconds(5));
+        schedule_reconnect_locked("resolve host failed", std::chrono::seconds(5));
         return false;
     }
 
     disconnect_locked();
     if (!open_udp_locked(udp_addr) || !open_tcp_locked(tcp_addr)) {
-        schedule_reconnect_locked();
+        schedule_reconnect_locked("open tcp/udp failed");
         return false;
     }
 
@@ -516,7 +533,7 @@ void Relay_Transport::flush_tcp_send_locked()
         if (sent == 0 || !relay_last_error_is_would_block()) {
             int err = relay_get_last_error();
             PRINT_DEBUG("relay tcp send failed err=%d name=%s", err, relay_socket_error_name(err));
-            schedule_reconnect_locked();
+            schedule_reconnect_locked("tcp send failed");
         }
         return;
     }
@@ -605,14 +622,14 @@ void Relay_Transport::read_tcp_locked()
 
         if (received == 0) {
             PRINT_DEBUG("relay tcp closed");
-            schedule_reconnect_locked();
+            schedule_reconnect_locked("tcp closed");
             return;
         }
 
         if (!relay_last_error_is_would_block()) {
             int err = relay_get_last_error();
             PRINT_DEBUG("relay tcp recv failed err=%d name=%s", err, relay_socket_error_name(err));
-            schedule_reconnect_locked();
+            schedule_reconnect_locked("tcp recv failed");
         }
         break;
     }
@@ -657,7 +674,7 @@ void Relay_Transport::read_udp_locked()
         if (!relay_last_error_is_would_block()) {
             int err = relay_get_last_error();
             PRINT_DEBUG("relay udp recv failed err=%d name=%s", err, relay_socket_error_name(err));
-            schedule_reconnect_locked();
+            schedule_reconnect_locked("udp recv failed");
         }
         return;
     }
@@ -675,7 +692,15 @@ void Relay_Transport::send_registration_locked(bool hello)
     uint16 type = hello ? RELAY_MSG_HELLO : RELAY_MSG_REGISTER;
     uint64 source_id = local_ids.empty() ? 0 : local_ids.front().ConvertToUint64();
     bool queued = queue_tcp_message_locked(type, 0, source_id, 0, 0, 0, payload);
-    PRINT_DEBUG("relay %s queued=%u appid=%u source_id=%llu ids=%zu listen_port=%u", relay_msg_name(type), queued ? 1u : 0u, appid, static_cast<unsigned long long>(source_id), local_ids.size(), listen_port);
+    PRINT_DEBUG(
+        "relay %s queued=%u appid=%u source_id=%llu ids=%s listen_port=%u",
+        relay_msg_name(type),
+        queued ? 1u : 0u,
+        appid,
+        static_cast<unsigned long long>(source_id),
+        relay_ids_string(local_ids).c_str(),
+        listen_port
+    );
     if (hello) {
         hello_sent = true;
     } else {
@@ -721,7 +746,7 @@ bool Relay_Transport::send_udp_message_locked(uint16 type, uint32 flags, uint64 
     if (!relay_last_error_is_would_block()) {
         int err = relay_get_last_error();
         PRINT_DEBUG("relay udp send failed err=%d name=%s", err, relay_socket_error_name(err));
-        schedule_reconnect_locked();
+        schedule_reconnect_locked("udp send failed");
     }
     return false;
 }
@@ -746,6 +771,25 @@ bool Relay_Transport::queue_tcp_message_locked(uint16 type, uint32 flags, uint64
     env.payload = payload;
 
     std::vector<char> bytes = serialize_envelope(env);
+    if (type == RELAY_MSG_HELLO || type == RELAY_MSG_REGISTER) {
+        RelayEnvelope decoded{};
+        if (deserialize_envelope(bytes, decoded)) {
+            std::vector<CSteamID> decoded_ids{};
+            uint16 decoded_listen_port = 0;
+            bool decoded_payload_ok = deserialize_ids_payload(decoded.payload, decoded_ids, decoded_listen_port);
+            PRINT_DEBUG(
+                "relay tcp self-check type=%s queued_source_id=%llu decoded_source_id=%llu decoded_payload_ok=%u decoded_ids=%s decoded_listen_port=%u",
+                relay_msg_name(type),
+                static_cast<unsigned long long>(source_id),
+                static_cast<unsigned long long>(decoded.source_id),
+                decoded_payload_ok ? 1u : 0u,
+                decoded_payload_ok ? relay_ids_string(decoded_ids).c_str() : "[]",
+                decoded_payload_ok ? decoded_listen_port : 0u
+            );
+        } else {
+            PRINT_DEBUG("relay tcp self-check type=%s decode_failed=1", relay_msg_name(type));
+        }
+    }
     append_u32(tcp_send_buffer, static_cast<uint32>(bytes.size()));
     tcp_send_buffer.insert(tcp_send_buffer.end(), bytes.begin(), bytes.end());
     PRINT_DEBUG("relay tcp queued type=%s payload_bytes=%zu frame_bytes=%zu pending=%zu flags=%u dest_id=%llu dest_ip=%u dest_port=%u", relay_msg_name(type), payload.size(), bytes.size(), tcp_send_buffer.size(), flags, static_cast<unsigned long long>(dest_id), dest_ip, dest_port);
@@ -792,13 +836,13 @@ void Relay_Transport::Run()
     if (welcomed &&
         std::chrono::duration_cast<std::chrono::seconds>(now - last_tcp_receive).count() >= RELAY_TCP_ACTIVITY_TIMEOUT_SECONDS) {
         PRINT_DEBUG("relay tcp receive timeout");
-        schedule_reconnect_locked();
+        schedule_reconnect_locked("tcp receive timeout");
         return;
     }
     if (welcomed &&
         std::chrono::duration_cast<std::chrono::seconds>(now - last_udp_receive).count() >= RELAY_UDP_ACTIVITY_TIMEOUT_SECONDS) {
         PRINT_DEBUG("relay udp receive timeout");
-        schedule_reconnect_locked();
+        schedule_reconnect_locked("udp receive timeout");
         return;
     }
 
@@ -811,7 +855,7 @@ void Relay_Transport::set_appid(uint32 next_appid)
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (appid == next_appid) return;
     appid = next_appid;
-    schedule_reconnect_locked(std::chrono::seconds(0));
+    schedule_reconnect_locked("appid changed", std::chrono::seconds(0));
 }
 
 void Relay_Transport::add_listen_id(CSteamID id)
@@ -822,6 +866,7 @@ void Relay_Transport::add_listen_id(CSteamID id)
     if (found != local_ids.end()) return;
     local_ids.push_back(id);
     registration_dirty = true;
+    PRINT_DEBUG("relay add_listen_id id=%llu ids=%s", (unsigned long long)id.ConvertToUint64(), relay_ids_string(local_ids).c_str());
 }
 
 bool Relay_Transport::Send(Common_Message *msg, bool reliable)

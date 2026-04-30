@@ -46,6 +46,7 @@ class Relay_Transport
     std::recursive_mutex mutex{};
 
     void schedule_reconnect_locked(std::chrono::seconds delay = std::chrono::seconds(2));
+    void schedule_reconnect_locked(const char *reason, std::chrono::seconds delay = std::chrono::seconds(2));
     void disconnect_locked();
     bool ensure_connected_locked();
     bool resolve_host_locked(sockaddr_in &addr, uint16 port);

@@ -15,7 +15,7 @@ pub const FLAG_BROADCAST: u32 = 1 << 0;
 pub const FLAG_HAS_DEST_STEAM_ID: u32 = 1 << 1;
 pub const FLAG_HAS_DEST_ENDPOINT: u32 = 1 << 2;
 
-const HEADER_SIZE: usize = 52;
+const HEADER_SIZE: usize = 56;
 
 #[derive(Clone, Debug)]
 pub struct Envelope {
@@ -156,7 +156,9 @@ pub fn decode_ids_payload(payload: &[u8]) -> Result<(u16, Vec<u64>), ProtocolErr
     let mut ids = Vec::with_capacity(count);
     let mut off = 4usize;
     while off < payload.len() {
-        ids.push(u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()));
+        ids.push(u64::from_le_bytes(
+            payload[off..off + 8].try_into().unwrap(),
+        ));
         off += 8;
     }
     Ok((listen_port, ids))
@@ -198,4 +200,58 @@ fn read_u64(data: &[u8], off: &mut usize) -> Result<u64, ProtocolError> {
     let value = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
     *off += 8;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_roundtrip_uses_full_header_size() {
+        let env = Envelope {
+            msg_type: MSG_WELCOME,
+            flags: FLAG_HAS_DEST_STEAM_ID | FLAG_HAS_DEST_ENDPOINT,
+            app_id: 3124540,
+            source_id: 100,
+            dest_id: 200,
+            source_virtual_ip: 0x0AC8_0080,
+            source_virtual_port: 47_584,
+            dest_virtual_ip: 0x0AC8_0081,
+            dest_virtual_port: 47_585,
+            session_token: 0x0123_4567_89AB_CDEF,
+            payload: vec![1, 2, 3, 4],
+        };
+
+        let encoded = encode_envelope(&env);
+        assert_eq!(encoded.len(), HEADER_SIZE + env.payload.len());
+
+        let decoded = decode_envelope(&encoded).unwrap();
+        assert_eq!(decoded.msg_type, env.msg_type);
+        assert_eq!(decoded.flags, env.flags);
+        assert_eq!(decoded.app_id, env.app_id);
+        assert_eq!(decoded.source_id, env.source_id);
+        assert_eq!(decoded.dest_id, env.dest_id);
+        assert_eq!(decoded.source_virtual_ip, env.source_virtual_ip);
+        assert_eq!(decoded.source_virtual_port, env.source_virtual_port);
+        assert_eq!(decoded.dest_virtual_ip, env.dest_virtual_ip);
+        assert_eq!(decoded.dest_virtual_port, env.dest_virtual_port);
+        assert_eq!(decoded.session_token, env.session_token);
+        assert_eq!(decoded.payload, env.payload);
+    }
+
+    #[test]
+    fn empty_payload_tcp_frame_roundtrips() {
+        let env = Envelope::heartbeat(3124540);
+        let encoded = encode_envelope(&env);
+        assert_eq!(encoded.len(), HEADER_SIZE);
+
+        let mut framed = frame_tcp(&encoded);
+        let frame = next_tcp_frame(&mut framed).unwrap();
+        assert!(framed.is_empty());
+
+        let decoded = decode_envelope(&frame).unwrap();
+        assert_eq!(decoded.msg_type, MSG_HEARTBEAT);
+        assert_eq!(decoded.app_id, env.app_id);
+        assert!(decoded.payload.is_empty());
+    }
 }

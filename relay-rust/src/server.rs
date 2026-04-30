@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -111,6 +112,12 @@ struct DisconnectHint {
     expires_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Replacement {
+    client_id: u64,
+    suppress_disconnect: bool,
+}
+
 impl Server {
     pub fn new(cfg: Config) -> io::Result<Self> {
         let tcp_listener = TcpListener::bind((cfg.listen_address.as_str(), cfg.tcp_port))?;
@@ -187,10 +194,25 @@ impl Server {
 
         loop {
             match conn.read(&mut tmp) {
-                Ok(0) => break,
+                Ok(0) => {
+                    info!(remote = ?remote, bound_client, "tcp connection closed by peer");
+                    break;
+                }
                 Ok(n) => {
                     buffer.extend_from_slice(&tmp[..n]);
                     while let Some(frame) = next_tcp_frame(&mut buffer) {
+                        if frame.len() >= 8 {
+                            let msg_type = u16::from_le_bytes([frame[6], frame[7]]);
+                            if msg_type == MSG_HELLO || msg_type == MSG_REGISTER {
+                                debug!(
+                                    remote = ?remote,
+                                    msg_type,
+                                    frame_len = frame.len(),
+                                    frame_hex = %hex_bytes(&frame),
+                                    "registration frame received"
+                                );
+                            }
+                        }
                         let env = match decode_envelope(&frame) {
                             Ok(env) => env,
                             Err(err) => {
@@ -216,7 +238,10 @@ impl Server {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(err) => {
+                    warn!(remote = ?remote, bound_client, error = %err, "tcp read failed");
+                    break;
+                }
             }
         }
 
@@ -375,30 +400,68 @@ impl Server {
             listen_port = 47_584;
         }
 
-        let primary_id = if env.source_id != 0 { env.source_id } else { ids[0] };
+        let primary_id = if env.source_id != 0 {
+            env.source_id
+        } else {
+            ids[0]
+        };
         let key = steam_key(env.app_id, primary_id);
         let now = Instant::now();
         let stream = Arc::new(Mutex::new(conn.try_clone()?));
-        let mut replaced = Vec::new();
+        let mut replacements = Vec::new();
         let current_id;
         let mut send_welcome = env.msg_type == MSG_HELLO;
+
+        info!(
+            remote = ?conn.peer_addr().ok(),
+            msg_type = env.msg_type,
+            app_id = env.app_id,
+            raw_source_id = %env.source_id,
+            payload_ids = ?ids,
+            bound_client,
+            "registration received"
+        );
+
+        if env.source_id != 0 && ids.first().copied() != Some(env.source_id) {
+            warn!(
+                remote = ?conn.peer_addr().ok(),
+                app_id = env.app_id,
+                msg_type = env.msg_type,
+                raw_source_id = %env.source_id,
+                payload_ids = ?ids,
+                bound_client,
+                "registration source_id differs from first payload id"
+            );
+        }
 
         {
             let mut state = self.state.lock().unwrap();
             let current = state.by_primary.get(&key).copied();
+            info!(
+                remote = ?conn.peer_addr().ok(),
+                app_id = env.app_id,
+                primary_id = %primary_id,
+                current_primary_owner = ?current,
+                bound_client,
+                "registration ownership lookup"
+            );
             let client_id = if let Some(bound_id) = bound_client {
                 if let Some(current_id) = current {
                     if current_id != bound_id {
-                        replaced.push(current_id);
+                        let suppress_disconnect =
+                            client_has_primary_locked(&state, current_id, primary_id);
+                        add_replacement(&mut replacements, current_id, suppress_disconnect);
                     }
                 }
                 bound_id
             } else if let Some(current_id) = current {
-                replaced.push(current_id);
+                let preserved_endpoint = client_endpoint_locked(&state, current_id);
+                add_replacement(&mut replacements, current_id, true);
                 let id = state.next_client_id;
                 state.next_client_id += 1;
                 let token = random_u64();
-                let virtual_ip = allocate_virtual_ip(&mut state);
+                let (virtual_ip, virtual_port) = preserved_endpoint
+                    .unwrap_or_else(|| (allocate_virtual_ip(&mut state), listen_port));
                 state.clients.insert(
                     id,
                     Arc::new(Client {
@@ -410,7 +473,7 @@ impl Server {
                             listen_port,
                             token,
                             virtual_ip,
-                            virtual_port: listen_port,
+                            virtual_port,
                             udp_addr: None,
                             last_seen: now,
                             closing: false,
@@ -457,9 +520,13 @@ impl Server {
             };
 
             if old_primary_key != key {
-                state.by_primary.remove(&old_primary_key);
+                if state.by_primary.get(&old_primary_key).copied() == Some(client_id) {
+                    state.by_primary.remove(&old_primary_key);
+                }
             }
-            state.by_endpoint.remove(&old_endpoint_key);
+            if state.by_endpoint.get(&old_endpoint_key).copied() == Some(client_id) {
+                state.by_endpoint.remove(&old_endpoint_key);
+            }
 
             for id in &data.listen_ids {
                 let listen_key = steam_key(data.app_id, *id);
@@ -471,7 +538,9 @@ impl Server {
             data.app_id = env.app_id;
             data.primary_id = primary_id;
             data.listen_port = listen_port;
-            data.virtual_port = listen_port;
+            if data.virtual_port == 0 {
+                data.virtual_port = listen_port;
+            }
             data.last_seen = now;
             data.closing = false;
             data.listen_ids = ids.iter().copied().collect();
@@ -480,7 +549,9 @@ impl Server {
                 let listen_key = steam_key(env.app_id, *id);
                 match state.by_steam_id.get(&listen_key).copied() {
                     Some(owner_id) if owner_id != client_id && *id == primary_id => {
-                        replaced.push(owner_id);
+                        let suppress_disconnect =
+                            client_has_primary_locked(&state, owner_id, primary_id);
+                        add_replacement(&mut replacements, owner_id, suppress_disconnect);
                         state.by_steam_id.insert(listen_key, client_id);
                     }
                     Some(_) => {}
@@ -505,9 +576,24 @@ impl Server {
             current_id = client_id;
         }
 
-        for client_id in replaced {
-            if client_id != current_id {
-                self.remove_client(Some(client_id), "replaced");
+        if !replacements.is_empty() {
+            info!(
+                remote = ?conn.peer_addr().ok(),
+                app_id = env.app_id,
+                primary_id = %primary_id,
+                current_id,
+                replaced = ?replacements.iter().map(|replacement| replacement.client_id).collect::<Vec<_>>(),
+                "registration will replace existing clients"
+            );
+        }
+
+        for replacement in replacements {
+            if replacement.client_id != current_id {
+                self.remove_client_with_options(
+                    Some(replacement.client_id),
+                    "replaced",
+                    replacement.suppress_disconnect,
+                );
             }
         }
 
@@ -536,7 +622,7 @@ impl Server {
         info!(
             remote = ?conn.peer_addr().ok(),
             app_id = env.app_id,
-            primary_id,
+            primary_id = %primary_id,
             listen_ids = ?ids,
             listen_port,
             virtual_endpoint = %self.client_snapshot(current_id).map(|c| format_virtual_endpoint(c.virtual_ip, c.virtual_port)).unwrap_or_else(|| "-".to_string()),
@@ -579,8 +665,8 @@ impl Server {
             self.maybe_send_disconnect_hint(sender_id, sender.app_id, &env);
             warn!(
                 app_id = sender.app_id,
-                source_id = env.source_id,
-                dest_id = env.dest_id,
+                source_id = %env.source_id,
+                dest_id = %env.dest_id,
                 dest_virtual_ip = env.dest_virtual_ip,
                 dest_virtual_port = env.dest_virtual_port,
                 flags = env.flags,
@@ -597,8 +683,20 @@ impl Server {
     fn deliver(&self, target_id: u64, env: Envelope, reliable: bool) {
         if reliable {
             let _ = self.send_tcp(target_id, env);
-        } else {
-            let _ = self.send_udp(target_id, env);
+            return;
+        }
+
+        match self.send_udp(target_id, env.clone()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AddrNotAvailable => {
+                debug!(
+                    target_id,
+                    msg_type = env.msg_type,
+                    "falling back to tcp delivery before udp endpoint is learned"
+                );
+                let _ = self.send_tcp(target_id, env);
+            }
+            Err(_) => {}
         }
     }
 
@@ -613,12 +711,13 @@ impl Server {
 
         let frame = frame_tcp(&encode_envelope(&env));
         let mut stream = client.stream.lock().unwrap();
+        let remote = stream.peer_addr().ok();
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         match stream.write_all(&frame) {
             Ok(()) => Ok(()),
             Err(err) => {
                 drop(stream);
-                warn!(target_id, msg_type = env.msg_type, error = %err, "tcp delivery failed");
+                warn!(target_id, remote = ?remote, msg_type = env.msg_type, error = %err, "tcp delivery failed");
                 self.remove_client(Some(target_id), "tcp write failed");
                 Err(err)
             }
@@ -635,8 +734,15 @@ impl Server {
             data.udp_addr
         };
         let Some(addr) = addr else {
-            warn!(target_id, msg_type = env.msg_type, "udp delivery skipped, missing udp address");
-            return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "missing udp addr"));
+            warn!(
+                target_id,
+                msg_type = env.msg_type,
+                "udp delivery skipped, missing udp address"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "missing udp addr",
+            ));
         };
 
         let payload = encode_envelope(&env);
@@ -645,6 +751,15 @@ impl Server {
     }
 
     fn remove_client(&self, target_id: Option<u64>, reason: &str) {
+        self.remove_client_with_options(target_id, reason, false);
+    }
+
+    fn remove_client_with_options(
+        &self,
+        target_id: Option<u64>,
+        reason: &str,
+        suppress_disconnect: bool,
+    ) {
         let Some(target_id) = target_id else {
             return;
         };
@@ -661,47 +776,79 @@ impl Server {
             data.closing = true;
 
             state.clients.remove(&target_id);
-            state.by_primary.remove(&steam_key(data.app_id, data.primary_id));
-            state.by_token.remove(&data.token);
-            state.by_endpoint.remove(&EndpointKey {
+            let primary_key = steam_key(data.app_id, data.primary_id);
+            if state.by_primary.get(&primary_key).copied() == Some(target_id) {
+                state.by_primary.remove(&primary_key);
+            }
+            if state.by_token.get(&data.token).copied() == Some(target_id) {
+                state.by_token.remove(&data.token);
+            }
+            let endpoint_key = EndpointKey {
                 app_id: data.app_id,
                 ip: data.virtual_ip,
                 port: data.virtual_port,
-            });
+            };
+            if state.by_endpoint.get(&endpoint_key).copied() == Some(target_id) {
+                state.by_endpoint.remove(&endpoint_key);
+            }
             for id in &data.listen_ids {
                 let key = steam_key(data.app_id, *id);
                 if state.by_steam_id.get(&key).copied() == Some(target_id) {
                     state.by_steam_id.remove(&key);
+                    if let Some(owner_id) = find_live_listen_owner(&state, data.app_id, *id) {
+                        state.by_steam_id.insert(key, owner_id);
+                    }
                 }
             }
 
-            let notify = state
-                .clients
-                .iter()
-                .filter_map(|(id, peer)| {
-                    let peer_data = peer.data.lock().unwrap();
-                    (peer_data.app_id == data.app_id).then_some(*id)
+            let notify = if suppress_disconnect {
+                Vec::new()
+            } else {
+                state
+                    .clients
+                    .iter()
+                    .filter_map(|(id, peer)| {
+                        let peer_data = peer.data.lock().unwrap();
+                        (peer_data.app_id == data.app_id).then_some(*id)
+                    })
+                    .collect()
+            };
+
+            let stale_listen_ids: Vec<u64> = sorted_ids(&data.listen_ids)
+                .into_iter()
+                .filter(|id| {
+                    state
+                        .by_steam_id
+                        .get(&steam_key(data.app_id, *id))
+                        .is_none()
                 })
                 .collect();
+            let endpoint_is_stale = state.by_endpoint.get(&endpoint_key).is_none();
 
             let hint = DisconnectHint {
                 app_id: data.app_id,
                 listen_port: data.listen_port,
-                listen_ids: sorted_ids(&data.listen_ids),
+                listen_ids: stale_listen_ids,
                 virtual_ip: data.virtual_ip,
                 virtual_port: data.virtual_port,
                 expires_at: Instant::now() + self.cfg.session_timeout,
             };
-            state.stale_endpoints.insert(
-                EndpointKey {
-                    app_id: hint.app_id,
-                    ip: hint.virtual_ip,
-                    port: hint.virtual_port,
-                },
-                hint.clone(),
-            );
-            for id in &hint.listen_ids {
-                state.stale_ids.insert(steam_key(hint.app_id, *id), hint.clone());
+            if !suppress_disconnect {
+                if endpoint_is_stale {
+                    state.stale_endpoints.insert(
+                        EndpointKey {
+                            app_id: hint.app_id,
+                            ip: hint.virtual_ip,
+                            port: hint.virtual_port,
+                        },
+                        hint.clone(),
+                    );
+                }
+                for id in &hint.listen_ids {
+                    state
+                        .stale_ids
+                        .insert(steam_key(hint.app_id, *id), hint.clone());
+                }
             }
 
             RemovedClient {
@@ -716,28 +863,39 @@ impl Server {
             }
         };
 
+        let tcp_remote = removed
+            .stream
+            .lock()
+            .unwrap()
+            .peer_addr()
+            .ok()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "-".to_string());
         let _ = removed.stream.lock().unwrap().shutdown(Shutdown::Both);
-        let disconnect = Envelope {
-            msg_type: MSG_DISCONNECT,
-            flags: 0,
-            app_id: removed.app_id,
-            source_id: removed.primary_id,
-            dest_id: 0,
-            source_virtual_ip: removed.virtual_ip,
-            source_virtual_port: removed.virtual_port,
-            dest_virtual_ip: 0,
-            dest_virtual_port: 0,
-            session_token: 0,
-            payload: encode_ids_payload(removed.listen_port, &removed.listen_ids),
-        };
-        for peer_id in removed.notify {
-            let _ = self.send_tcp(peer_id, disconnect.clone());
+        if !removed.notify.is_empty() && !removed.listen_ids.is_empty() {
+            let disconnect = Envelope {
+                msg_type: MSG_DISCONNECT,
+                flags: 0,
+                app_id: removed.app_id,
+                source_id: removed.primary_id,
+                dest_id: 0,
+                source_virtual_ip: removed.virtual_ip,
+                source_virtual_port: removed.virtual_port,
+                dest_virtual_ip: 0,
+                dest_virtual_port: 0,
+                session_token: 0,
+                payload: encode_ids_payload(removed.listen_port, &removed.listen_ids),
+            };
+            for peer_id in removed.notify {
+                let _ = self.send_tcp(peer_id, disconnect.clone());
+            }
         }
         info!(
             app_id = removed.app_id,
-            primary_id = removed.primary_id,
+            primary_id = %removed.primary_id,
             listen_ids = ?removed.listen_ids,
             virtual_endpoint = %format_virtual_endpoint(removed.virtual_ip, removed.virtual_port),
+            tcp_remote = %tcp_remote,
             reason,
             "client disconnected"
         );
@@ -758,7 +916,10 @@ impl Server {
     fn resolve_target(&self, app_id: u32, env: &Envelope) -> Option<u64> {
         let state = self.state.lock().unwrap();
         if env.flags & FLAG_HAS_DEST_STEAM_ID != 0 {
-            return state.by_steam_id.get(&steam_key(app_id, env.dest_id)).copied();
+            return state
+                .by_steam_id
+                .get(&steam_key(app_id, env.dest_id))
+                .copied();
         }
         if env.flags & FLAG_HAS_DEST_ENDPOINT != 0 {
             return state
@@ -836,7 +997,7 @@ impl Server {
             data.udp_addr = Some(addr);
             data.last_seen = now;
             if first || changed {
-                debug!(app_id = data.app_id, primary_id = data.primary_id, remote = %addr, "udp endpoint learned");
+                debug!(app_id = data.app_id, primary_id = %data.primary_id, remote = %addr, "udp endpoint learned");
             }
         }
     }
@@ -983,6 +1144,54 @@ impl Server {
     }
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn add_replacement(replacements: &mut Vec<Replacement>, client_id: u64, suppress_disconnect: bool) {
+    if let Some(existing) = replacements
+        .iter_mut()
+        .find(|replacement| replacement.client_id == client_id)
+    {
+        existing.suppress_disconnect |= suppress_disconnect;
+        return;
+    }
+    replacements.push(Replacement {
+        client_id,
+        suppress_disconnect,
+    });
+}
+
+fn client_has_primary_locked(state: &ServerState, client_id: u64, primary_id: u64) -> bool {
+    state
+        .clients
+        .get(&client_id)
+        .map(|client| client.data.lock().unwrap().primary_id == primary_id)
+        .unwrap_or(false)
+}
+
+fn client_endpoint_locked(state: &ServerState, client_id: u64) -> Option<(u32, u16)> {
+    state.clients.get(&client_id).map(|client| {
+        let data = client.data.lock().unwrap();
+        (data.virtual_ip, data.virtual_port)
+    })
+}
+
+fn find_live_listen_owner(state: &ServerState, app_id: u32, listen_id: u64) -> Option<u64> {
+    state
+        .clients
+        .iter()
+        .filter_map(|(client_id, client)| {
+            let data = client.data.lock().unwrap();
+            (data.app_id == app_id && data.listen_ids.contains(&listen_id)).then_some(*client_id)
+        })
+        .max()
+}
+
 fn sorted_ids(ids: &HashSet<u64>) -> Vec<u64> {
     let mut out: Vec<u64> = ids.iter().copied().collect();
     out.sort_unstable();
@@ -1012,4 +1221,202 @@ fn random_u64() -> u64 {
 fn format_virtual_endpoint(ip: u32, port: u16) -> String {
     let ip = Ipv4Addr::from(ip);
     format!("{ip}:{port}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+
+    const APP_ID: u32 = 3_124_540;
+    const LISTEN_PORT: u16 = 47_584;
+
+    fn test_server() -> Server {
+        Server::new(Config {
+            listen_address: "127.0.0.1".to_string(),
+            tcp_port: 0,
+            udp_port: 0,
+            ..Config::default()
+        })
+        .unwrap()
+    }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        (server, client)
+    }
+
+    fn registration_env(msg_type: u16, primary_id: u64, ids: &[u64]) -> Envelope {
+        Envelope {
+            msg_type,
+            flags: 0,
+            app_id: APP_ID,
+            source_id: primary_id,
+            dest_id: 0,
+            source_virtual_ip: 0,
+            source_virtual_port: 0,
+            dest_virtual_ip: 0,
+            dest_virtual_port: 0,
+            session_token: 0,
+            payload: encode_ids_payload(LISTEN_PORT, ids),
+        }
+    }
+
+    fn read_tcp_envelope(stream: &mut TcpStream) -> Envelope {
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).unwrap();
+        let len = u32::from_le_bytes(len) as usize;
+        let mut frame = vec![0u8; len];
+        stream.read_exact(&mut frame).unwrap();
+        decode_envelope(&frame).unwrap()
+    }
+
+    fn register(server: &Server, primary_id: u64, ids: &[u64]) -> (u64, TcpStream) {
+        let (server_stream, mut client_stream) = tcp_pair();
+        let client_id = server
+            .register_client(
+                &server_stream,
+                registration_env(MSG_HELLO, primary_id, ids),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let welcome = read_tcp_envelope(&mut client_stream);
+        assert_eq!(welcome.msg_type, MSG_WELCOME);
+        (client_id, client_stream)
+    }
+
+    #[test]
+    fn same_primary_reconnect_preserves_endpoint_and_indexes() {
+        let server = test_server();
+        let primary_id = 8_556_839_772_967_8218;
+        let secondary_id = 76_561_198_374_632_266;
+        let (old_client_id, _old_client) =
+            register(&server, primary_id, &[primary_id, secondary_id]);
+        let old_snapshot = server.client_snapshot(old_client_id).unwrap();
+
+        let (server_stream, mut new_client) = tcp_pair();
+        let new_client_id = server
+            .register_client(
+                &server_stream,
+                registration_env(MSG_HELLO, primary_id, &[primary_id, secondary_id]),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let welcome = read_tcp_envelope(&mut new_client);
+        assert_eq!(welcome.msg_type, MSG_WELCOME);
+
+        let state = server.state.lock().unwrap();
+        assert!(!state.clients.contains_key(&old_client_id));
+        assert_eq!(
+            state
+                .by_primary
+                .get(&steam_key(APP_ID, primary_id))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(
+            state
+                .by_steam_id
+                .get(&steam_key(APP_ID, secondary_id))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(
+            state
+                .by_endpoint
+                .get(&EndpointKey {
+                    app_id: APP_ID,
+                    ip: old_snapshot.virtual_ip,
+                    port: old_snapshot.virtual_port,
+                })
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(welcome.source_virtual_ip, old_snapshot.virtual_ip);
+        assert_eq!(welcome.source_virtual_port, old_snapshot.virtual_port);
+        assert!(state.stale_ids.is_empty());
+        assert!(state.stale_endpoints.is_empty());
+    }
+
+    #[test]
+    fn removing_old_shared_secondary_reindexes_to_remaining_client() {
+        let server = test_server();
+        let old_primary = 10;
+        let new_primary = 11;
+        let shared_secondary = 99;
+        let (old_client_id, _old_client) =
+            register(&server, old_primary, &[old_primary, shared_secondary]);
+        let (new_client_id, _new_client) =
+            register(&server, new_primary, &[new_primary, shared_secondary]);
+
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(
+                state
+                    .by_steam_id
+                    .get(&steam_key(APP_ID, shared_secondary))
+                    .copied(),
+                Some(old_client_id)
+            );
+        }
+
+        server.remove_client(Some(old_client_id), "test");
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .by_steam_id
+                .get(&steam_key(APP_ID, shared_secondary))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert!(state
+            .stale_ids
+            .get(&steam_key(APP_ID, shared_secondary))
+            .is_none());
+        assert!(state
+            .stale_ids
+            .get(&steam_key(APP_ID, old_primary))
+            .is_some());
+    }
+
+    #[test]
+    fn unreliable_delivery_falls_back_to_tcp_until_udp_addr_is_known() {
+        let server = test_server();
+        let (sender_id, _sender_client) = register(&server, 100, &[100]);
+        let (_target_id, mut target_client) = register(&server, 200, &[200]);
+
+        server.route_envelope(
+            sender_id,
+            Envelope {
+                msg_type: MSG_UNRELIABLE,
+                flags: FLAG_HAS_DEST_STEAM_ID,
+                app_id: APP_ID,
+                source_id: 100,
+                dest_id: 200,
+                source_virtual_ip: 0,
+                source_virtual_port: 0,
+                dest_virtual_ip: 0,
+                dest_virtual_port: 0,
+                session_token: 0,
+                payload: vec![1, 2, 3],
+            },
+            false,
+        );
+
+        let delivered = read_tcp_envelope(&mut target_client);
+        assert_eq!(delivered.msg_type, MSG_UNRELIABLE);
+        assert_eq!(delivered.source_id, 100);
+        assert_eq!(delivered.dest_id, 200);
+        assert_eq!(delivered.payload, vec![1, 2, 3]);
+    }
 }

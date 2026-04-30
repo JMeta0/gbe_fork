@@ -855,6 +855,11 @@ void Relay_Transport::set_appid(uint32 next_appid)
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (appid == next_appid) return;
     appid = next_appid;
+    if (!welcomed) {
+        registration_dirty = true;
+        PRINT_DEBUG("relay appid changed before welcome appid=%u", appid);
+        return;
+    }
     schedule_reconnect_locked("appid changed", std::chrono::seconds(0));
 }
 
@@ -908,12 +913,12 @@ bool Relay_Transport::SendToEndpoint(Common_Message *msg, uint32 ip, uint16 port
 
     uint32 flags = RELAY_FLAG_HAS_DEST_ENDPOINT;
     uint64 source_id = msg->source_id();
-    if (msg->dest_id() != 0) flags |= RELAY_FLAG_HAS_DEST_STEAMID;
+    uint64 dest_id = 0;
 
     if (reliable) {
-        return queue_tcp_message_locked(RELAY_MSG_RELIABLE, flags, source_id, msg->dest_id(), ip, port, payload);
+        return queue_tcp_message_locked(RELAY_MSG_RELIABLE, flags, source_id, dest_id, ip, port, payload);
     }
-    return send_udp_message_locked(RELAY_MSG_UNRELIABLE, flags, source_id, msg->dest_id(), ip, port, payload);
+    return send_udp_message_locked(RELAY_MSG_UNRELIABLE, flags, source_id, dest_id, ip, port, payload);
 }
 
 bool Relay_Transport::SendBroadcast(Common_Message *msg)

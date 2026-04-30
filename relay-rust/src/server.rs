@@ -437,6 +437,8 @@ impl Server {
         {
             let mut state = self.state.lock().unwrap();
             let current = state.by_primary.get(&key).copied();
+            let alias_handoff =
+                find_handoff_owner_locked(&state, env.app_id, primary_id, &ids, bound_client);
             info!(
                 remote = ?conn.peer_addr().ok(),
                 app_id = env.app_id,
@@ -457,57 +459,41 @@ impl Server {
             } else if let Some(current_id) = current {
                 let preserved_endpoint = client_endpoint_locked(&state, current_id);
                 add_replacement(&mut replacements, current_id, true);
-                let id = state.next_client_id;
-                state.next_client_id += 1;
-                let token = random_u64();
-                let (virtual_ip, virtual_port) = preserved_endpoint
-                    .unwrap_or_else(|| (allocate_virtual_ip(&mut state), listen_port));
-                state.clients.insert(
-                    id,
-                    Arc::new(Client {
-                        stream: Arc::clone(&stream),
-                        data: Mutex::new(ClientData {
-                            app_id: env.app_id,
-                            primary_id,
-                            listen_ids: HashSet::new(),
-                            listen_port,
-                            token,
-                            virtual_ip,
-                            virtual_port,
-                            udp_addr: None,
-                            last_seen: now,
-                            closing: false,
-                        }),
-                    }),
-                );
-                send_welcome = true;
-                id
+                self.insert_client_locked(
+                    &mut state,
+                    &stream,
+                    env.app_id,
+                    primary_id,
+                    listen_port,
+                    preserved_endpoint,
+                    now,
+                )
+            } else if let Some(owner_id) = alias_handoff {
+                let preserved_endpoint = client_endpoint_locked(&state, owner_id);
+                add_replacement(&mut replacements, owner_id, true);
+                self.insert_client_locked(
+                    &mut state,
+                    &stream,
+                    env.app_id,
+                    primary_id,
+                    listen_port,
+                    preserved_endpoint,
+                    now,
+                )
             } else {
-                let id = state.next_client_id;
-                state.next_client_id += 1;
-                let token = random_u64();
-                let virtual_ip = allocate_virtual_ip(&mut state);
-                state.clients.insert(
-                    id,
-                    Arc::new(Client {
-                        stream: Arc::clone(&stream),
-                        data: Mutex::new(ClientData {
-                            app_id: env.app_id,
-                            primary_id,
-                            listen_ids: HashSet::new(),
-                            listen_port,
-                            token,
-                            virtual_ip,
-                            virtual_port: listen_port,
-                            udp_addr: None,
-                            last_seen: now,
-                            closing: false,
-                        }),
-                    }),
-                );
-                send_welcome = true;
-                id
+                self.insert_client_locked(
+                    &mut state,
+                    &stream,
+                    env.app_id,
+                    primary_id,
+                    listen_port,
+                    None,
+                    now,
+                )
             };
+            if send_welcome || bound_client.is_none() {
+                send_welcome = true;
+            }
 
             let client = state.clients.get(&client_id).unwrap().clone();
             let mut data = client.data.lock().unwrap();
@@ -552,6 +538,14 @@ impl Server {
                         let suppress_disconnect =
                             client_has_primary_locked(&state, owner_id, primary_id);
                         add_replacement(&mut replacements, owner_id, suppress_disconnect);
+                        state.by_steam_id.insert(listen_key, client_id);
+                    }
+                    Some(owner_id)
+                        if owner_id != client_id
+                            && is_individual_steam_id(*id)
+                            && alias_handoff == Some(owner_id) =>
+                    {
+                        add_replacement(&mut replacements, owner_id, true);
                         state.by_steam_id.insert(listen_key, client_id);
                     }
                     Some(_) => {}
@@ -631,6 +625,42 @@ impl Server {
         );
 
         Ok(Some(current_id))
+    }
+
+    fn insert_client_locked(
+        &self,
+        state: &mut ServerState,
+        stream: &Arc<Mutex<TcpStream>>,
+        app_id: u32,
+        primary_id: u64,
+        listen_port: u16,
+        preserved_endpoint: Option<(u32, u16)>,
+        now: Instant,
+    ) -> u64 {
+        let id = state.next_client_id;
+        state.next_client_id += 1;
+        let token = random_u64();
+        let (virtual_ip, virtual_port) =
+            preserved_endpoint.unwrap_or_else(|| (allocate_virtual_ip(state), listen_port));
+        state.clients.insert(
+            id,
+            Arc::new(Client {
+                stream: Arc::clone(stream),
+                data: Mutex::new(ClientData {
+                    app_id,
+                    primary_id,
+                    listen_ids: HashSet::new(),
+                    listen_port,
+                    token,
+                    virtual_ip,
+                    virtual_port,
+                    udp_addr: None,
+                    last_seen: now,
+                    closing: false,
+                }),
+            }),
+        );
+        id
     }
 
     fn route_envelope(&self, sender_id: u64, mut env: Envelope, reliable: bool) {
@@ -915,12 +945,6 @@ impl Server {
 
     fn resolve_target(&self, app_id: u32, env: &Envelope) -> Option<u64> {
         let state = self.state.lock().unwrap();
-        if env.flags & FLAG_HAS_DEST_STEAM_ID != 0 {
-            return state
-                .by_steam_id
-                .get(&steam_key(app_id, env.dest_id))
-                .copied();
-        }
         if env.flags & FLAG_HAS_DEST_ENDPOINT != 0 {
             return state
                 .by_endpoint
@@ -931,6 +955,12 @@ impl Server {
                 })
                 .copied();
         }
+        if env.flags & FLAG_HAS_DEST_STEAM_ID != 0 {
+            return state
+                .by_steam_id
+                .get(&steam_key(app_id, env.dest_id))
+                .copied();
+        }
         None
     }
 
@@ -938,17 +968,7 @@ impl Server {
         let hint = {
             let state = self.state.lock().unwrap();
             let now = Instant::now();
-            if env.flags & FLAG_HAS_DEST_STEAM_ID != 0 {
-                if let Some(hint) = state.stale_ids.get(&steam_key(app_id, env.dest_id)) {
-                    if now < hint.expires_at {
-                        Some(hint.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else if env.flags & FLAG_HAS_DEST_ENDPOINT != 0 {
+            if env.flags & FLAG_HAS_DEST_ENDPOINT != 0 {
                 state
                     .stale_endpoints
                     .get(&EndpointKey {
@@ -958,6 +978,16 @@ impl Server {
                     })
                     .filter(|hint| now < hint.expires_at)
                     .cloned()
+            } else if env.flags & FLAG_HAS_DEST_STEAM_ID != 0 {
+                if let Some(hint) = state.stale_ids.get(&steam_key(app_id, env.dest_id)) {
+                    if now < hint.expires_at {
+                        Some(hint.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1181,6 +1211,20 @@ fn client_endpoint_locked(state: &ServerState, client_id: u64) -> Option<(u32, u
     })
 }
 
+fn find_handoff_owner_locked(
+    state: &ServerState,
+    app_id: u32,
+    primary_id: u64,
+    ids: &[u64],
+    bound_client: Option<u64>,
+) -> Option<u64> {
+    ids.iter()
+        .copied()
+        .filter(|id| *id != primary_id && is_individual_steam_id(*id))
+        .filter_map(|id| state.by_steam_id.get(&steam_key(app_id, id)).copied())
+        .find(|owner_id| Some(*owner_id) != bound_client)
+}
+
 fn find_live_listen_owner(state: &ServerState, app_id: u32, listen_id: u64) -> Option<u64> {
     state
         .clients
@@ -1190,6 +1234,11 @@ fn find_live_listen_owner(state: &ServerState, app_id: u32, listen_id: u64) -> O
             (data.app_id == app_id && data.listen_ids.contains(&listen_id)).then_some(*client_id)
         })
         .max()
+}
+
+fn is_individual_steam_id(steam_id: u64) -> bool {
+    const ACCOUNT_TYPE_INDIVIDUAL: u64 = 1;
+    ((steam_id >> 52) & 0xF) == ACCOUNT_TYPE_INDIVIDUAL
 }
 
 fn sorted_ids(ids: &HashSet<u64>) -> Vec<u64> {
@@ -1348,6 +1397,67 @@ mod tests {
     }
 
     #[test]
+    fn new_goldberg_server_primary_with_same_user_alias_hands_off_session() {
+        let server = test_server();
+        let old_primary = 8_556_839_772_967_8218;
+        let new_primary = 8_556_839_830_666_3778;
+        let stable_user = 76_561_198_374_632_266;
+        let (old_client_id, _old_client) =
+            register(&server, old_primary, &[old_primary, stable_user]);
+        let old_snapshot = server.client_snapshot(old_client_id).unwrap();
+
+        let (server_stream, mut new_client) = tcp_pair();
+        let new_client_id = server
+            .register_client(
+                &server_stream,
+                registration_env(MSG_HELLO, new_primary, &[new_primary, stable_user]),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let welcome = read_tcp_envelope(&mut new_client);
+
+        let state = server.state.lock().unwrap();
+        assert!(!state.clients.contains_key(&old_client_id));
+        assert_eq!(
+            state
+                .by_primary
+                .get(&steam_key(APP_ID, old_primary))
+                .copied(),
+            None
+        );
+        assert_eq!(
+            state
+                .by_primary
+                .get(&steam_key(APP_ID, new_primary))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(
+            state
+                .by_steam_id
+                .get(&steam_key(APP_ID, stable_user))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(
+            state
+                .by_endpoint
+                .get(&EndpointKey {
+                    app_id: APP_ID,
+                    ip: old_snapshot.virtual_ip,
+                    port: old_snapshot.virtual_port,
+                })
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(welcome.source_virtual_ip, old_snapshot.virtual_ip);
+        assert_eq!(welcome.source_virtual_port, old_snapshot.virtual_port);
+        assert!(state.stale_ids.is_empty());
+        assert!(state.stale_endpoints.is_empty());
+    }
+
+    #[test]
     fn removing_old_shared_secondary_reindexes_to_remaining_client() {
         let server = test_server();
         let old_primary = 10;
@@ -1418,5 +1528,39 @@ mod tests {
         assert_eq!(delivered.source_id, 100);
         assert_eq!(delivered.dest_id, 200);
         assert_eq!(delivered.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn endpoint_routing_takes_precedence_over_stale_dest_id() {
+        let server = test_server();
+        let (sender_id, _sender_client) = register(&server, 100, &[100]);
+        let (_steam_id_owner, _owner_client) = register(&server, 200, &[200]);
+        let (_endpoint_owner, mut endpoint_client) = register(&server, 300, &[300]);
+        let endpoint = server.client_snapshot(_endpoint_owner).unwrap();
+
+        server.route_envelope(
+            sender_id,
+            Envelope {
+                msg_type: MSG_UNRELIABLE,
+                flags: FLAG_HAS_DEST_STEAM_ID | FLAG_HAS_DEST_ENDPOINT,
+                app_id: APP_ID,
+                source_id: 100,
+                dest_id: 200,
+                source_virtual_ip: 0,
+                source_virtual_port: 0,
+                dest_virtual_ip: endpoint.virtual_ip,
+                dest_virtual_port: endpoint.virtual_port,
+                session_token: 0,
+                payload: vec![9, 8, 7],
+            },
+            false,
+        );
+
+        let delivered = read_tcp_envelope(&mut endpoint_client);
+        assert_eq!(delivered.msg_type, MSG_UNRELIABLE);
+        assert_eq!(delivered.dest_id, 200);
+        assert_eq!(delivered.dest_virtual_ip, endpoint.virtual_ip);
+        assert_eq!(delivered.dest_virtual_port, endpoint.virtual_port);
+        assert_eq!(delivered.payload, vec![9, 8, 7]);
     }
 }

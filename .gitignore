@@ -30,3 +30,5 @@
 /tools/migrate_gse/.py*/
 /tools/migrate_gse/.env*/
 /tools/migrate_gse/bin
+
+.codegraph

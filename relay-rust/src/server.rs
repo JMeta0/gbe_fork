@@ -61,6 +61,7 @@ struct ClientData {
     udp_addr: Option<SocketAddr>,
     last_seen: Instant,
     closing: bool,
+    dead_since: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Eq)]
@@ -224,7 +225,7 @@ impl Server {
                             Ok(next) => bound_client = next,
                             Err(err) => {
                                 warn!(remote = ?remote, error = %err, "tcp envelope handling failed");
-                                self.remove_client(bound_client, "tcp closed");
+                                self.mark_client_dead(bound_client, "tcp closed");
                                 return;
                             }
                         }
@@ -245,7 +246,7 @@ impl Server {
             }
         }
 
-        self.remove_client(bound_client, "tcp closed");
+        self.mark_client_dead(bound_client, "tcp closed");
     }
 
     fn handle_tcp_envelope(
@@ -348,7 +349,10 @@ impl Server {
                     .iter()
                     .filter_map(|(id, client)| {
                         let data = client.data.lock().unwrap();
-                        if now.duration_since(data.last_seen) > self.cfg.session_timeout {
+                        // Dead clients (lost TCP, awaiting reconnect) are reaped
+                        // from when they went dead; live ones from last activity.
+                        let deadline = data.dead_since.unwrap_or(data.last_seen);
+                        if now.duration_since(deadline) > self.cfg.session_timeout {
                             Some(*id)
                         } else {
                             None
@@ -481,13 +485,23 @@ impl Server {
                     now,
                 )
             } else {
+                let preserved_endpoint =
+                    reclaim_stale_endpoint_locked(&state, env.app_id, primary_id, &ids);
+                if let Some((ip, port)) = preserved_endpoint {
+                    debug!(
+                        app_id = env.app_id,
+                        primary_id = %primary_id,
+                        preserved_endpoint = %format_virtual_endpoint(ip, port),
+                        "reconnect reclaiming stale virtual endpoint"
+                    );
+                }
                 self.insert_client_locked(
                     &mut state,
                     &stream,
                     env.app_id,
                     primary_id,
                     listen_port,
-                    None,
+                    preserved_endpoint,
                     now,
                 )
             };
@@ -657,6 +671,7 @@ impl Server {
                     udp_addr: None,
                     last_seen: now,
                     closing: false,
+                    dead_since: None,
                 }),
             }),
         );
@@ -712,7 +727,15 @@ impl Server {
 
     fn deliver(&self, target_id: u64, env: Envelope, reliable: bool) {
         if reliable {
-            let _ = self.send_tcp(target_id, env);
+            let msg_type = env.msg_type;
+            if let Err(err) = self.send_tcp(target_id, env) {
+                debug!(
+                    target_id,
+                    msg_type,
+                    error = %err,
+                    "reliable delivery failed (client may be awaiting reconnect)"
+                );
+            }
             return;
         }
 
@@ -738,6 +761,15 @@ impl Server {
         let Some(client) = client else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "missing client"));
         };
+        {
+            let data = client.data.lock().unwrap();
+            if data.dead_since.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "client connection is dead",
+                ));
+            }
+        }
 
         let frame = frame_tcp(&encode_envelope(&env));
         let mut stream = client.stream.lock().unwrap();
@@ -748,7 +780,7 @@ impl Server {
             Err(err) => {
                 drop(stream);
                 warn!(target_id, remote = ?remote, msg_type = env.msg_type, error = %err, "tcp delivery failed");
-                self.remove_client(Some(target_id), "tcp write failed");
+                self.mark_client_dead(Some(target_id), "tcp write failed");
                 Err(err)
             }
         }
@@ -778,6 +810,40 @@ impl Server {
         let payload = encode_envelope(&env);
         self.udp_socket.send_to(&payload, addr)?;
         Ok(())
+    }
+
+    /// A client's TCP connection died but it may come back shortly (VPN blip,
+    /// network hiccup). Instead of tearing the session down and telling every
+    /// peer, keep the client fully indexed — same virtual endpoint, same
+    /// token — so a quick re-registration resumes seamlessly. `cleanup_loop`
+    /// reaps it (with normal peer notification) after `session_timeout`.
+    fn mark_client_dead(&self, target_id: Option<u64>, reason: &str) {
+        let Some(target_id) = target_id else {
+            return;
+        };
+        let (app_id, primary_id, virtual_endpoint) = {
+            let state = self.state.lock().unwrap();
+            let Some(client) = state.clients.get(&target_id) else {
+                return;
+            };
+            let mut data = client.data.lock().unwrap();
+            if data.dead_since.is_some() {
+                return;
+            }
+            data.dead_since = Some(Instant::now());
+            (
+                data.app_id,
+                data.primary_id,
+                format_virtual_endpoint(data.virtual_ip, data.virtual_port),
+            )
+        };
+        info!(
+            app_id,
+            primary_id = %primary_id,
+            virtual_endpoint = %virtual_endpoint,
+            reason,
+            "client connection lost, awaiting reconnect"
+        );
     }
 
     fn remove_client(&self, target_id: Option<u64>, reason: &str) {
@@ -1211,6 +1277,39 @@ fn client_endpoint_locked(state: &ServerState, client_id: u64) -> Option<(u32, u
     })
 }
 
+/// Look up the virtual endpoint of a previously removed client so a reconnect
+/// gets the same address other peers already cached, instead of a fresh one.
+///
+/// Peers address each other by virtual endpoint (see `SendToEndpoint`), so an
+/// endpoint change on reconnect silently breaks every in-flight session. The
+/// stale hints recorded by `remove_client_with_options` keep the old endpoint
+/// for `session_timeout`; reuse it when nobody else owns it.
+fn reclaim_stale_endpoint_locked(
+    state: &ServerState,
+    app_id: u32,
+    primary_id: u64,
+    ids: &[u64],
+) -> Option<(u32, u16)> {
+    let now = Instant::now();
+    let lookup = |id: u64| {
+        state
+            .stale_ids
+            .get(&steam_key(app_id, id))
+            .filter(|hint| now < hint.expires_at)
+            .map(|hint| (hint.virtual_ip, hint.virtual_port))
+    };
+    let preserved = lookup(primary_id).or_else(|| ids.iter().copied().find_map(lookup));
+    preserved.filter(|(ip, port)| {
+        !state
+            .by_endpoint
+            .contains_key(&EndpointKey {
+                app_id,
+                ip: *ip,
+                port: *port,
+            })
+    })
+}
+
 fn find_handoff_owner_locked(
     state: &ServerState,
     app_id: u32,
@@ -1394,6 +1493,243 @@ mod tests {
         assert_eq!(welcome.source_virtual_port, old_snapshot.virtual_port);
         assert!(state.stale_ids.is_empty());
         assert!(state.stale_endpoints.is_empty());
+    }
+
+    #[test]
+    fn reconnect_after_removal_reclaims_stale_endpoint() {
+        // Reproduces the reported production failure: client TCP closes, the relay
+        // removes it (recording stale hints), and the client reconnects seconds
+        // later. The welcome must hand back the SAME virtual endpoint so peers
+        // that cached it keep routing without any rediscovery.
+        let server = test_server();
+        let primary_id = 85_568_397_729_678_218;
+        let secondary_id = 76_561_198_374_632_266;
+        let (old_client_id, _old_client) =
+            register(&server, primary_id, &[primary_id, secondary_id]);
+        let old_snapshot = server.client_snapshot(old_client_id).unwrap();
+
+        // Simulate "tcp connection closed by peer": full removal + stale hints.
+        server.remove_client(Some(old_client_id), "tcp closed");
+        assert!(!server.state.lock().unwrap().stale_ids.is_empty());
+        assert!(!server.state.lock().unwrap().stale_endpoints.is_empty());
+
+        // Reconnect on a fresh TCP connection before the hint expires.
+        let (server_stream, mut new_client) = tcp_pair();
+        let new_client_id = server
+            .register_client(
+                &server_stream,
+                registration_env(MSG_HELLO, primary_id, &[primary_id, secondary_id]),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let welcome = read_tcp_envelope(&mut new_client);
+        assert_eq!(welcome.msg_type, MSG_WELCOME);
+        assert_eq!(welcome.source_virtual_ip, old_snapshot.virtual_ip);
+        assert_eq!(welcome.source_virtual_port, old_snapshot.virtual_port);
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .by_primary
+                .get(&steam_key(APP_ID, primary_id))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(
+            state
+                .by_endpoint
+                .get(&EndpointKey {
+                    app_id: APP_ID,
+                    ip: old_snapshot.virtual_ip,
+                    port: old_snapshot.virtual_port,
+                })
+                .copied(),
+            Some(new_client_id)
+        );
+        // Reclaiming must consume the stale hints so they cannot be reused later.
+        assert!(state.stale_ids.is_empty());
+        assert!(state.stale_endpoints.is_empty());
+    }
+
+    #[test]
+    fn game_restart_new_primary_same_user_reclaims_endpoint_after_removal() {
+        // Mirrors the production log: a player's connection drops, the relay
+        // removes the client, and the player restarts the game — which yields a
+        // brand-new primary id but the same stable user id. The restarted game
+        // must get the OLD virtual endpoint back (reclaimed via the shared user
+        // id), otherwise the peer that cached the endpoint goes blind.
+        let server = test_server();
+        let old_primary = 85_568_397_729_678_218; // previous session primary
+        let new_primary = 85_568_398_305_883_339; // restarted game primary
+        let user_id = 76_561_199_606_275_031; // stable user id
+        let (old_client_id, _old_client) = register(&server, old_primary, &[old_primary, user_id]);
+        let old_snapshot = server.client_snapshot(old_client_id).unwrap();
+
+        // The old session is fully gone (relay removed it on TCP close).
+        server.remove_client(Some(old_client_id), "tcp closed");
+        assert!(!server.state.lock().unwrap().stale_ids.is_empty());
+
+        // The user restarts the game: new primary, same user id.
+        let (server_stream, mut new_client) = tcp_pair();
+        let new_client_id = server
+            .register_client(
+                &server_stream,
+                registration_env(MSG_HELLO, new_primary, &[new_primary, user_id]),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let welcome = read_tcp_envelope(&mut new_client);
+        assert_eq!(welcome.msg_type, MSG_WELCOME);
+        assert_eq!(welcome.source_virtual_ip, old_snapshot.virtual_ip);
+        assert_eq!(welcome.source_virtual_port, old_snapshot.virtual_port);
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .by_primary
+                .get(&steam_key(APP_ID, new_primary))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(
+            state
+                .by_steam_id
+                .get(&steam_key(APP_ID, user_id))
+                .copied(),
+            Some(new_client_id)
+        );
+        assert_eq!(
+            state
+                .by_endpoint
+                .get(&EndpointKey {
+                    app_id: APP_ID,
+                    ip: old_snapshot.virtual_ip,
+                    port: old_snapshot.virtual_port,
+                })
+                .copied(),
+            Some(new_client_id)
+        );
+        assert!(state.stale_endpoints.is_empty());
+    }
+
+    #[test]
+    fn reconnect_within_grace_keeps_session_without_peer_notification() {
+        // A short TCP blip must not tear the session down: B's connection dies,
+        // B re-registers within the grace window, and A never hears about it —
+        // no disconnect event, same virtual endpoint, routing still works.
+        let server = test_server();
+        let primary_id = 85_568_397_729_678_218;
+        let secondary_id = 76_561_198_374_632_266;
+        let (a_id, mut a_stream) = register(&server, 500, &[500]);
+        let (b_id, _b_stream) = register(&server, primary_id, &[primary_id, secondary_id]);
+        let b_snapshot = server.client_snapshot(b_id).unwrap();
+
+        // B's TCP closes: mark dead, keep indexed, notify nobody.
+        server.mark_client_dead(Some(b_id), "tcp closed");
+        {
+            let state = server.state.lock().unwrap();
+            assert!(state.clients.contains_key(&b_id));
+            assert!(state.stale_ids.is_empty());
+            assert!(state.stale_endpoints.is_empty());
+        }
+
+        // A must receive nothing during the blip.
+        a_stream
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        let mut buf = [0u8; 128];
+        assert!(a_stream.read(&mut buf).is_err());
+
+        // B reconnects on a fresh TCP connection inside the grace window.
+        let (server_stream, mut new_client) = tcp_pair();
+        let new_b_id = server
+            .register_client(
+                &server_stream,
+                registration_env(MSG_HELLO, primary_id, &[primary_id, secondary_id]),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let welcome = read_tcp_envelope(&mut new_client);
+        assert_eq!(welcome.msg_type, MSG_WELCOME);
+        assert_eq!(welcome.source_virtual_ip, b_snapshot.virtual_ip);
+        assert_eq!(welcome.source_virtual_port, b_snapshot.virtual_port);
+
+        let state = server.state.lock().unwrap();
+        assert!(!state.clients.contains_key(&b_id));
+        assert_eq!(
+            state
+                .by_primary
+                .get(&steam_key(APP_ID, primary_id))
+                .copied(),
+            Some(new_b_id)
+        );
+        assert_eq!(
+            state
+                .by_endpoint
+                .get(&EndpointKey {
+                    app_id: APP_ID,
+                    ip: b_snapshot.virtual_ip,
+                    port: b_snapshot.virtual_port,
+                })
+                .copied(),
+            Some(new_b_id)
+        );
+        // Suppressed replacement leaves no stale hints behind.
+        assert!(state.stale_ids.is_empty());
+        assert!(state.stale_endpoints.is_empty());
+        drop(state);
+
+        // A can still route to B by the preserved endpoint.
+        server.route_envelope(
+            a_id,
+            Envelope {
+                msg_type: MSG_UNRELIABLE,
+                flags: FLAG_HAS_DEST_ENDPOINT,
+                app_id: APP_ID,
+                source_id: 500,
+                dest_id: 0,
+                source_virtual_ip: 0,
+                source_virtual_port: 0,
+                dest_virtual_ip: b_snapshot.virtual_ip,
+                dest_virtual_port: b_snapshot.virtual_port,
+                session_token: 0,
+                payload: vec![1, 2, 3],
+            },
+            false,
+        );
+        let delivered = read_tcp_envelope(&mut new_client);
+        assert_eq!(delivered.msg_type, MSG_UNRELIABLE);
+        assert_eq!(delivered.dest_virtual_ip, b_snapshot.virtual_ip);
+        assert_eq!(delivered.dest_virtual_port, b_snapshot.virtual_port);
+        assert_eq!(delivered.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn reaping_dead_client_after_grace_notifies_peers() {
+        // Once the grace window expires, the dead client is removed the normal
+        // way: peers are notified and stale hints are recorded so a later
+        // reconnect can still reclaim the endpoint.
+        let server = test_server();
+        let primary_id = 85_568_397_729_678_218;
+        let (_a_id, mut a_stream) = register(&server, 500, &[500]);
+        let (b_id, _b_stream) = register(&server, primary_id, &[primary_id]);
+        let b_snapshot = server.client_snapshot(b_id).unwrap();
+        server.mark_client_dead(Some(b_id), "tcp closed");
+
+        // This is what cleanup_loop does once dead_since exceeds session_timeout.
+        server.remove_client(Some(b_id), "timeout");
+
+        let disconnect = read_tcp_envelope(&mut a_stream);
+        assert_eq!(disconnect.msg_type, MSG_DISCONNECT);
+        assert_eq!(disconnect.source_virtual_ip, b_snapshot.virtual_ip);
+        assert_eq!(disconnect.source_virtual_port, b_snapshot.virtual_port);
+        let state = server.state.lock().unwrap();
+        assert!(!state.clients.contains_key(&b_id));
+        assert!(!state.stale_ids.is_empty());
+        assert!(!state.stale_endpoints.is_empty());
     }
 
     #[test]

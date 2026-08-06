@@ -814,6 +814,13 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
     PRINT_DEBUG("Handle Announce: %u, " "%" PRIu64 ", %u, %u", conn->appid, msg->source_id(), msg->announce().appid(), msg->announce().type());
     conn->tcp_ip_port = ip_port;
     conn->tcp_ip_port.port = htons(msg->announce().tcp_port());
+    // A peer that reconnected announces from its current endpoint. Refresh the
+    // UDP endpoint too, so we can reach it without waiting for a PONG round-trip
+    // (PONG only updates it when the peer answers a PING).
+    if (conn->udp_ip_port.ip != ip_port.ip || conn->udp_ip_port.port != ip_port.port) {
+        PRINT_DEBUG("updated udp endpoint from announce to %u:%u", (unsigned)ntohl(ip_port.ip), (unsigned)ntohs(ip_port.port));
+        conn->udp_ip_port = ip_port;
+    }
     conn->appid = msg->announce().appid();
 
     for (int i = 0; i < msg->announce().ids_size(); ++i) {

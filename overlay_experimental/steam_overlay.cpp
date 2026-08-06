@@ -242,7 +242,7 @@ Steam_Overlay::Steam_Overlay(Settings* settings, Local_Storage *local_storage, S
 
     parse_key_combo();
     parse_screenshot_key_combo();
-    strncpy(username_text, settings->get_local_name(), sizeof(username_text));
+    strncpy(username_text, settings->get_local_name(), sizeof(username_text) - 1);
 
     // we need these copies to show the warning only once, then disable the flag
     // avoid manipulating settings->xxx
@@ -950,7 +950,8 @@ void Steam_Overlay::build_friend_window(Friend const& frd, friend_window_state& 
             }
         }
 
-        ImGui::InputTextMultiline("##chat_history", &state.chat_history[0], state.chat_history.length(), { -1.0f, -2.0f * ImGui::GetFontSize() }, ImGuiInputTextFlags_ReadOnly);
+        // buf_size must include the terminating NUL: std::string::data() is length()+1 bytes
+        ImGui::InputTextMultiline("##chat_history", &state.chat_history[0], state.chat_history.length() + 1, { -1.0f, -2.0f * ImGui::GetFontSize() }, ImGuiInputTextFlags_ReadOnly);
         // TODO: Fix the layout of the chat line + send button.
         // It should be like this: chat input should fill the window size minus send button size (button size is fixed)
         // |------------------------------|
@@ -2377,7 +2378,7 @@ void Steam_Overlay::render_main_window()
                 ImGui::Spacing();
 
                 ImGui::PushItemWidth(ImGui::CalcTextSize(url.c_str()).x + 20);
-                ImGui::InputText("##url_copy", (char *)url.data(), url.size(), ImGuiInputTextFlags_ReadOnly);
+                ImGui::InputText("##url_copy", (char *)url.data(), url.size() + 1, ImGuiInputTextFlags_ReadOnly);
                 ImGui::PopItemWidth();
 
                 ImGui::Spacing();

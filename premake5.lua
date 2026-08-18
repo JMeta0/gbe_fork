@@ -211,6 +211,7 @@ end
 ---------
 local common_emu_defines = { -- added to all filters, later defines will be appended
     "UTF_CPP_CPLUSPLUS=201703L", "CURL_STATICLIB", "CONTROLLER_SUPPORT", "EMU_BUILD_STRING=" .. _OPTIONS["emubuild"],
+    "JUICE_STATIC",
 }
 
 -- include dirs
@@ -224,6 +225,8 @@ local common_include = {
     'crash_printer',
     'sdk',
     "overlay_experimental",
+    'third-party/libjuice/include',
+    'third-party/libjuice/include/juice', -- for the libjuice sources' #include "juice.h"
 }
 
 local x32_deps_include = {
@@ -276,6 +279,8 @@ local common_files = {
     "helpers/common_helpers.cpp", "helpers/common_helpers/**",
     -- helpers/dbg_log
     "helpers/dbg_log.cpp", "helpers/dbg_log/**",
+    -- vendored libjuice (ICE/STUN/TURN)
+    "third-party/libjuice/**",
 }
 
 local overlay_files = {
@@ -716,7 +721,7 @@ includedirs {
 
 
 -- disable warnings for external libraries/deps
-filter { 'files:proto_gen/** or libs/** or build/deps/**' }
+filter { 'files:proto_gen/** or libs/** or build/deps/** or third-party/libjuice/**' }
     warnings 'Off'
 filter {} -- reset the filter and remove all active keywords
 

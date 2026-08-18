@@ -266,10 +266,18 @@ public:
 
     //networking
     bool disable_networking = false;
-    bool enable_relay = false;
-    std::string relay_host{};
-    uint16 relay_tcp_port = 23010;
-    uint16 relay_udp_port = 23011;
+
+    // ICE (libjuice) internet transport: WebSocket signaling + STUN/TURN
+    bool enable_ice = false;
+    std::string signaling_host{};
+    uint16 signaling_port = 49100;
+    std::string signaling_secret{};
+    std::string stun_host{};
+    uint16 stun_port = 3478;
+    std::string turn_host{};
+    uint16 turn_port = 3478;
+    std::string turn_user{};
+    std::string turn_pass{};
 
     //gameserver source query
     bool disable_source_query = false;

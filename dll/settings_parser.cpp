@@ -1866,25 +1866,48 @@ static void parse_simple_features(class Settings *settings_client, class Setting
     settings_client->disable_networking = ini.GetBoolValue("main::connectivity", "disable_networking", settings_client->disable_networking);
     settings_server->disable_networking = ini.GetBoolValue("main::connectivity", "disable_networking", settings_server->disable_networking);
 
-    settings_client->enable_relay = ini.GetBoolValue("main::connectivity", "enable_relay", settings_client->enable_relay);
-    settings_server->enable_relay = ini.GetBoolValue("main::connectivity", "enable_relay", settings_server->enable_relay);
+    // ICE internet transport (WebSocket signaling + STUN/TURN)
+    settings_client->enable_ice = ini.GetBoolValue("main::connectivity", "enable_ice", settings_client->enable_ice);
+    settings_server->enable_ice = ini.GetBoolValue("main::connectivity", "enable_ice", settings_server->enable_ice);
 
-    settings_client->relay_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "relay_host", settings_client->relay_host.c_str()));
-    settings_server->relay_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "relay_host", settings_server->relay_host.c_str()));
-
-    {
-        long val_client = ini.GetLongValue("main::connectivity", "relay_tcp_port", settings_client->relay_tcp_port);
-        settings_client->relay_tcp_port = static_cast<uint16>(std::clamp<long>(val_client, 0, std::numeric_limits<uint16>::max()));
-        long val_server = ini.GetLongValue("main::connectivity", "relay_tcp_port", settings_server->relay_tcp_port);
-        settings_server->relay_tcp_port = static_cast<uint16>(std::clamp<long>(val_server, 0, std::numeric_limits<uint16>::max()));
-    }
+    settings_client->signaling_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "signaling_host", settings_client->signaling_host.c_str()));
+    settings_server->signaling_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "signaling_host", settings_server->signaling_host.c_str()));
 
     {
-        long val_client = ini.GetLongValue("main::connectivity", "relay_udp_port", settings_client->relay_udp_port);
-        settings_client->relay_udp_port = static_cast<uint16>(std::clamp<long>(val_client, 0, std::numeric_limits<uint16>::max()));
-        long val_server = ini.GetLongValue("main::connectivity", "relay_udp_port", settings_server->relay_udp_port);
-        settings_server->relay_udp_port = static_cast<uint16>(std::clamp<long>(val_server, 0, std::numeric_limits<uint16>::max()));
+        long val_client = ini.GetLongValue("main::connectivity", "signaling_port", settings_client->signaling_port);
+        settings_client->signaling_port = static_cast<uint16>(std::clamp<long>(val_client, 0, std::numeric_limits<uint16>::max()));
+        long val_server = ini.GetLongValue("main::connectivity", "signaling_port", settings_server->signaling_port);
+        settings_server->signaling_port = static_cast<uint16>(std::clamp<long>(val_server, 0, std::numeric_limits<uint16>::max()));
     }
+
+    settings_client->signaling_secret = common_helpers::string_strip(ini.GetValue("main::connectivity", "signaling_secret", settings_client->signaling_secret.c_str()));
+    settings_server->signaling_secret = common_helpers::string_strip(ini.GetValue("main::connectivity", "signaling_secret", settings_server->signaling_secret.c_str()));
+
+    settings_client->stun_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "stun_host", settings_client->stun_host.c_str()));
+    settings_server->stun_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "stun_host", settings_server->stun_host.c_str()));
+
+    {
+        long val_client = ini.GetLongValue("main::connectivity", "stun_port", settings_client->stun_port);
+        settings_client->stun_port = static_cast<uint16>(std::clamp<long>(val_client, 0, std::numeric_limits<uint16>::max()));
+        long val_server = ini.GetLongValue("main::connectivity", "stun_port", settings_server->stun_port);
+        settings_server->stun_port = static_cast<uint16>(std::clamp<long>(val_server, 0, std::numeric_limits<uint16>::max()));
+    }
+
+    settings_client->turn_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "turn_host", settings_client->turn_host.c_str()));
+    settings_server->turn_host = common_helpers::string_strip(ini.GetValue("main::connectivity", "turn_host", settings_server->turn_host.c_str()));
+
+    {
+        long val_client = ini.GetLongValue("main::connectivity", "turn_port", settings_client->turn_port);
+        settings_client->turn_port = static_cast<uint16>(std::clamp<long>(val_client, 0, std::numeric_limits<uint16>::max()));
+        long val_server = ini.GetLongValue("main::connectivity", "turn_port", settings_server->turn_port);
+        settings_server->turn_port = static_cast<uint16>(std::clamp<long>(val_server, 0, std::numeric_limits<uint16>::max()));
+    }
+
+    settings_client->turn_user = common_helpers::string_strip(ini.GetValue("main::connectivity", "turn_user", settings_client->turn_user.c_str()));
+    settings_server->turn_user = common_helpers::string_strip(ini.GetValue("main::connectivity", "turn_user", settings_server->turn_user.c_str()));
+
+    settings_client->turn_pass = common_helpers::string_strip(ini.GetValue("main::connectivity", "turn_pass", settings_client->turn_pass.c_str()));
+    settings_server->turn_pass = common_helpers::string_strip(ini.GetValue("main::connectivity", "turn_pass", settings_server->turn_pass.c_str()));
 
     settings_client->disable_sharing_stats_with_gameserver = ini.GetBoolValue("main::connectivity", "disable_sharing_stats_with_gameserver", settings_client->disable_sharing_stats_with_gameserver);
     settings_server->disable_sharing_stats_with_gameserver = ini.GetBoolValue("main::connectivity", "disable_sharing_stats_with_gameserver", settings_server->disable_sharing_stats_with_gameserver);

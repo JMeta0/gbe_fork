@@ -153,25 +153,26 @@ An example is provided in `steam_settings.EXAMPLE\custom_broadcasts.EXAMPLE.txt`
 
 ---
 
-## Public Relay Mode:
-To route Goldberg networking through a public relay instead of LAN discovery/direct peer sockets, configure these values in `configs.main.ini`:
+## Internet (ICE) mode:
+To route Goldberg networking over the internet instead of LAN discovery/direct peer sockets, configure these values in `configs.main.ini`:
 
 - `disable_lan_only=1`
-- `enable_relay=1`
-- `relay_host=<public DNS or IPv4>`
-- `relay_tcp_port=<relay TCP port>`
-- `relay_udp_port=<relay UDP port>`
+- `enable_ice=1`
+- `signaling_host=<public DNS or IPv4>`
+- `signaling_port=49100`
+- `signaling_secret=<optional shared secret, must match the server>`
+- `stun_host=<STUN server>` / `stun_port=3478` (NAT hole punching; not effective behind symmetric NAT)
+- `turn_host=<TURN server>` / `turn_port=3478` / `turn_user=...` / `turn_pass=...` (guaranteed fallback behind symmetric NAT)
 
-When relay mode is enabled, Goldberg keeps the same internal Steam interfaces but transports discovery and peer traffic through the configured relay server.
+The internet mode uses libjuice (RFC 8445 ICE) with a WebSocket signaling server and STUN/TURN. The bundled server stack (WebSocket signaling + coturn) lives in the `ice-stack` directory; see `ice-stack/README.md` for deployment and firewall requirements.
+
+When ICE mode is enabled, Goldberg keeps the same internal Steam interfaces but transports discovery and peer traffic over ICE connections (direct P2P when possible, TURN-relayed otherwise).
 
 Notes:
 
-- relay mode replaces the old LAN transport path, it does not combine with it
+- ICE mode replaces the old LAN transport path, it does not combine with it
 - `custom_broadcasts.txt` is still for the LAN/custom-broadcast path only
-- `matchmaking_server_details_via_source_query=1` is not supported in relay mode, Goldberg falls back to the non-query behavior
-- the bundled Go relay config/example lives in the `relay` directory
-
-For future maintenance when rebasing against upstream Goldberg, see `RELAY_REBASE.md` in the repository root.
+- `matchmaking_server_details_via_source_query=1` is not supported in ICE mode, Goldberg falls back to the non-query behavior
 
 ---
 

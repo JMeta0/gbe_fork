@@ -17,7 +17,7 @@
 
 #include "dll/network.h"
 #include "dll/dll.h"
-#include "dll/relay_transport.h"
+#include "dll/ice_transport.h"
 
 #define MAX_BROADCASTS 16
 static int number_broadcasts = -1;
@@ -26,7 +26,7 @@ static uint32_t lower_range_ips[MAX_BROADCASTS];
 static uint32_t upper_range_ips[MAX_BROADCASTS];
 
 #define BROADCAST_INTERVAL 5.0
-#define RELAY_REDISCOVERY_INTERVAL 1.0
+#define ICE_REDISCOVERY_INTERVAL 1.0
 #define HEARTBEAT_TIMEOUT 20.0
 #define USER_TIMEOUT 20.0
 
@@ -659,7 +659,7 @@ struct Connection *Networking::find_or_create_connection(CSteamID search_id, uin
     return new_connection(search_id, appid);
 }
 
-void Networking::relay_mark_peer_online(Common_Message *msg, IP_PORT ip_port)
+void Networking::ice_mark_peer_online(Common_Message *msg, IP_PORT ip_port)
 {
     if (!msg || !msg->source_id()) return;
 
@@ -691,7 +691,7 @@ void Networking::relay_mark_peer_online(Common_Message *msg, IP_PORT ip_port)
     }
 }
 
-void Networking::relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 disconnected_ip, uint16 disconnected_port)
+void Networking::ice_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 disconnected_ip, uint16 disconnected_port)
 {
     if (peer_ids.empty()) return;
 
@@ -738,29 +738,29 @@ void Networking::relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids, 
         conn = connections.erase(conn);
     }
 
-    trigger_relay_rediscovery("peer offline");
+    trigger_ice_rediscovery("peer offline");
 }
 
-void Networking::relay_dispatch_messages()
+void Networking::ice_dispatch_messages()
 {
-    if (!relay_transport) return;
+    if (!ice_transport) return;
 
     std::vector<CSteamID> disconnected_ids{};
     uint32 disconnected_ip = 0;
     uint16 disconnected_port = 0;
-    while (relay_transport->PollDisconnect(disconnected_ids, disconnected_ip, disconnected_port)) {
-        relay_mark_peer_offline(disconnected_ids, disconnected_ip, disconnected_port);
+    while (ice_transport->PollDisconnect(disconnected_ids, disconnected_ip, disconnected_port)) {
+        ice_mark_peer_offline(disconnected_ids, disconnected_ip, disconnected_port);
     }
 
     Common_Message msg{};
     IP_PORT ip_port{};
     bool reliable = false;
-    while (relay_transport->PollPacket(&msg, &ip_port, &reliable)) {
+    while (ice_transport->PollPacket(&msg, &ip_port, &reliable)) {
         if (!msg.source_id()) {
             continue;
         }
 
-        relay_mark_peer_online(&msg, ip_port);
+        ice_mark_peer_online(&msg, ip_port);
 
         if (msg.has_announce()) {
             handle_announce(&msg, ip_port);
@@ -774,20 +774,21 @@ void Networking::relay_dispatch_messages()
     }
 }
 
-void Networking::trigger_relay_rediscovery(const char *reason)
+void Networking::trigger_ice_rediscovery(const char *reason)
 {
-    if (!relay_transport) return;
+    if (!ice_transport) return;
 
     auto now = std::chrono::high_resolution_clock::now();
-    if (!check_timedout(last_relay_rediscovery, RELAY_REDISCOVERY_INTERVAL)) {
+    if (!check_timedout(last_ice_rediscovery, ICE_REDISCOVERY_INTERVAL)) {
         return;
     }
 
-    last_relay_rediscovery = now;
+    last_ice_rediscovery = now;
     last_broadcast = std::chrono::high_resolution_clock::time_point{};
     PRINT_DEBUG("relay rediscovery requested: %s", reason ? reason : "unknown");
 
-    if (relay_transport->ready()) {
+    if (ice_transport->ready()) {
+        ice_transport->request_list();
         send_announce_broadcasts();
     }
 }
@@ -842,8 +843,8 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
             IP_PORT ipp{};
             ipp.ip = msg->announce().peers(i).ip();
             ipp.port = htons(msg->announce().peers(i).udp_port());
-            if (relay_transport) {
-                relay_transport->SendToEndpoint(&msg_, ntohl(ipp.ip), ntohs(ipp.port), false);
+            if (ice_transport) {
+                ice_transport->SendToEndpoint(&msg_, ntohl(ipp.ip), ntohs(ipp.port), false);
             } else {
                 size_t size = msg_.ByteSizeLong();
                 char *buffer = new char[size];
@@ -858,8 +859,8 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
 
     if (msg->announce().type() == Announce::PING) {
         Common_Message msg = create_announce(false);
-        if (relay_transport) {
-            relay_transport->SendToEndpoint(&msg, ntohl(ip_port.ip), ntohs(ip_port.port), false);
+        if (ice_transport) {
+            ice_transport->SendToEndpoint(&msg, ntohl(ip_port.ip), ntohs(ip_port.port), false);
         } else {
             size_t size = msg.ByteSizeLong(); 
             char *buffer = new char[size];
@@ -871,8 +872,8 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
         //send ping packet if not pinged
         if (!conn->udp_pinged) {
             Common_Message msg = create_announce(true);
-            if (relay_transport) {
-                relay_transport->SendToEndpoint(&msg, ntohl(ip_port.ip), ntohs(ip_port.port), false);
+            if (ice_transport) {
+                ice_transport->SendToEndpoint(&msg, ntohl(ip_port.ip), ntohs(ip_port.port), false);
             } else {
                 size_t size = msg.ByteSizeLong();
                 char *buffer = new char[size];
@@ -917,7 +918,7 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
     own_ip = 0x7F000001;
     last_run = std::chrono::high_resolution_clock::now();
     last_broadcast = std::chrono::high_resolution_clock::time_point{};
-    last_relay_rediscovery = std::chrono::high_resolution_clock::time_point{};
+    last_ice_rediscovery = std::chrono::high_resolution_clock::time_point{};
     this->appid = appid;
 
     if (disable_sockets) {
@@ -927,8 +928,12 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
         return;
     }
 
-    if (settings && settings->enable_relay && !settings->relay_host.empty() && settings->relay_tcp_port != 0 && settings->relay_udp_port != 0) {
-        relay_transport = new Relay_Transport(settings->relay_host, settings->relay_tcp_port, settings->relay_udp_port, port, appid, id);
+    if (settings && settings->enable_ice && !settings->signaling_host.empty() && settings->signaling_port != 0) {
+        ice_transport = new Ice_Transport(
+            settings->signaling_host, settings->signaling_port, settings->signaling_secret,
+            settings->stun_host, settings->stun_port,
+            settings->turn_host, settings->turn_port, settings->turn_user, settings->turn_pass,
+            port, appid, id);
 
         if (curl_global_init(CURL_GLOBAL_ALL) == 0) {
             PRINT_DEBUG("CURL successful");
@@ -936,7 +941,7 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
             PRINT_DEBUG("CURL: could not initialize");
         }
 
-        enabled = relay_transport->enabled();
+        enabled = ice_transport->enabled();
         ids.push_back(id);
         reset_last_error();
         return;
@@ -1043,8 +1048,8 @@ Networking::~Networking()
 
     kill_socket(udp_socket);
     kill_socket(tcp_socket);
-    delete relay_transport;
-    relay_transport = nullptr;
+    delete ice_transport;
+    ice_transport = nullptr;
 
     curl_global_cleanup();
 }
@@ -1069,12 +1074,26 @@ Common_Message Networking::create_announce(bool request)
         }
     }
 
-    announce->set_tcp_port(relay_transport && relay_transport->ready() ? relay_transport->virtual_port() : tcp_port);
+    announce->set_tcp_port(ice_transport && ice_transport->ready() ? ice_transport->virtual_port() : tcp_port);
     announce->set_appid(this->appid);
     for (auto &id : ids) announce->add_ids(id.ConvertToUint64());
     Common_Message msg;
     msg.set_allocated_announce(announce);
-    msg.set_source_id(ids[0].ConvertToUint64());
+
+    // Announce as the per-player individual account id when one is present
+    // (falls back to ids[0] for game servers / single-id setups). The old
+    // behavior announced as the game-server id, which every client sharing the
+    // same config also has: the receiver's "ignoring self announce" check then
+    // dropped the announce and the friend list never lit up for two clients
+    // using the same config (e.g. sandboxed multi-instance testing).
+    uint64 announce_source_id = ids.empty() ? 0 : ids[0].ConvertToUint64();
+    for (const auto &id : ids) {
+        if (id.BIndividualAccount()) {
+            announce_source_id = id.ConvertToUint64();
+            break;
+        }
+    }
+    msg.set_source_id(announce_source_id);
     return msg;
 }
 
@@ -1082,8 +1101,8 @@ void Networking::send_announce_broadcasts()
 {
     Common_Message msg = create_announce(true);
 
-    if (relay_transport) {
-        bool sent = relay_transport->SendBroadcast(&msg);
+    if (ice_transport) {
+        bool sent = ice_transport->SendBroadcast(&msg);
         last_broadcast = std::chrono::high_resolution_clock::now();
         if (sent) {
             PRINT_DEBUG("sent relay broadcasts");
@@ -1117,29 +1136,33 @@ void Networking::Run()
         return;
     }
 
-    if (relay_transport) {
-        relay_transport->Run();
-        bool relay_ready = relay_transport->ready();
-        if (relay_ready && !relay_ready_last_run) {
-            trigger_relay_rediscovery("relay session restored");
+    if (ice_transport) {
+        ice_transport->Run();
+        bool ice_ready = ice_transport->ready();
+        if (ice_ready && !ice_ready_last_run) {
+            trigger_ice_rediscovery("ice session restored");
         }
-        relay_ready_last_run = relay_ready;
+        ice_ready_last_run = ice_ready;
 
-        if (relay_ready) {
-            own_ip = relay_transport->virtual_ip();
+        if (ice_transport->poll_new_connection()) {
+            trigger_ice_rediscovery("ice peer connected");
+        }
+
+        if (ice_ready) {
+            own_ip = ice_transport->virtual_ip();
         }
 
         if (check_timedout(last_broadcast, BROADCAST_INTERVAL)) {
             send_announce_broadcasts();
         }
 
-        relay_dispatch_messages();
+        ice_dispatch_messages();
 
         std::vector<Common_Message> local_send_copy = local_send;
         local_send.clear();
         for (auto &m : local_send_copy) {
             m.set_source_ip(own_ip);
-            m.set_source_port(relay_transport->ready() ? relay_transport->virtual_port() : udp_port);
+            m.set_source_port(ice_transport->ready() ? ice_transport->virtual_port() : udp_port);
             do_callbacks_message(&m);
         }
 
@@ -1354,7 +1377,7 @@ void Networking::Run()
                 kill_tcp_socket(conn->tcp_socket_incoming);
                 conn = connections.erase(conn);
                 PRINT_DEBUG("USER TIMEOUT");
-                trigger_relay_rediscovery("peer timeout");
+                trigger_ice_rediscovery("peer timeout");
             } else {
                 ++conn;
             }
@@ -1365,7 +1388,7 @@ void Networking::Run()
         if (!(conn.tcp_socket_incoming.received_data || conn.tcp_socket_outgoing.received_data)) {
             if (conn.connected) for (auto &steam_id : conn.ids) run_callback_user(steam_id, false, conn.appid);
             conn.connected = false;
-            trigger_relay_rediscovery("peer disconnected");
+            trigger_ice_rediscovery("peer disconnected");
         }
     }
 
@@ -1382,8 +1405,8 @@ void Networking::addListenId(CSteamID id)
 
     PRINT_DEBUG("ADDED ID %llu", (uint64)id.ConvertToUint64());
     ids.push_back(id);
-    if (relay_transport) {
-        relay_transport->add_listen_id(id);
+    if (ice_transport) {
+        ice_transport->add_listen_id(id);
     }
     send_announce_broadcasts();
     return;
@@ -1392,15 +1415,15 @@ void Networking::addListenId(CSteamID id)
 void Networking::setAppID(uint32 appid)
 {
     this->appid = appid;
-    if (relay_transport) {
-        relay_transport->set_appid(appid);
+    if (ice_transport) {
+        ice_transport->set_appid(appid);
     }
 }
 
 bool Networking::sendToIPPort(Common_Message *msg, uint32 ip, uint16 port, bool reliable)
 {
-    if (relay_transport) {
-        return relay_transport->SendToEndpoint(msg, ip, port, reliable);
+    if (ice_transport) {
+        return ice_transport->SendToEndpoint(msg, ip, port, reliable);
     }
 
     bool is_local_ip = ((ip >> 24) == 0x7F);
@@ -1461,8 +1484,8 @@ bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
         conn = find_connection(dest_id, this->appid);
     }
 
-    if (!ret && relay_transport) {
-        ret = relay_transport->Send(msg, reliable);
+    if (!ret && ice_transport) {
+        ret = ice_transport->Send(msg, reliable);
     }
 
     if (!ret && conn) {
@@ -1594,7 +1617,7 @@ uint32 Networking::getOwnIP()
 
 void Networking::startQuery(IP_PORT ip_port)
 {
-    if (relay_transport) {
+    if (ice_transport) {
         PRINT_DEBUG("source query is unsupported in relay mode");
         query_alive = false;
         return;
@@ -1666,6 +1689,6 @@ void Networking::shutDownQuery()
 
 bool Networking::isQueryAlive()
 {
-    if (relay_transport) return false;
+    if (ice_transport) return false;
     return query_alive;
 }

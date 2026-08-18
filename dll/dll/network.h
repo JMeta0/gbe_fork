@@ -97,7 +97,7 @@ struct Connection {
 };
 
 class Settings;
-class Relay_Transport;
+class Ice_Transport;
 
 class Networking
 {
@@ -108,13 +108,13 @@ class Networking
     uint16 udp_port{}, tcp_port{};
     uint32 own_ip{};
     std::vector<struct Connection> connections{};
-    Relay_Transport *relay_transport{};
+    Ice_Transport *ice_transport{};
 
     std::vector<CSteamID> ids;
     uint32 appid;
     std::chrono::high_resolution_clock::time_point last_broadcast;
-    std::chrono::high_resolution_clock::time_point last_relay_rediscovery;
-    bool relay_ready_last_run = false;
+    std::chrono::high_resolution_clock::time_point last_ice_rediscovery;
+    bool ice_ready_last_run = false;
     std::vector<IP_PORT> custom_broadcasts;
 
     std::vector<struct TCP_Socket> accepted;
@@ -126,10 +126,10 @@ class Networking
     struct Connection *find_connection(CSteamID id, uint32 appid = 0);
     struct Connection *new_connection(CSteamID id, uint32 appid);
     struct Connection *find_or_create_connection(CSteamID id, uint32 appid);
-    void relay_mark_peer_online(Common_Message *msg, IP_PORT ip_port);
-    void relay_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 virtual_ip, uint16 virtual_port);
-    void relay_dispatch_messages();
-    void trigger_relay_rediscovery(const char *reason);
+    void ice_mark_peer_online(Common_Message *msg, IP_PORT ip_port);
+    void ice_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 virtual_ip, uint16 virtual_port);
+    void ice_dispatch_messages();
+    void trigger_ice_rediscovery(const char *reason);
 
     bool handle_announce(Common_Message *msg, IP_PORT ip_port);
     bool handle_low_level_udp(Common_Message *msg, IP_PORT ip_port);

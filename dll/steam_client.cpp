@@ -280,6 +280,7 @@ Steam_Client::~Steam_Client()
 
 void Steam_Client::userLogIn()
 {
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
     callback_results_client->clear();
     network->addListenId(settings_client->get_local_steam_id());
     user_logged_in = true;

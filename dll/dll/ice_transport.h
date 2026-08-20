@@ -9,6 +9,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -102,6 +103,30 @@ public:
     uint16 virtual_port();
 
 private:
+    // Per-agent context passed to libjuice as user_ptr. Carries the owning
+    // transport and the peer id so the callbacks never need to touch the
+    // transport mutex (libjuice invokes callbacks while holding its own
+    // per-agent lock; taking the transport mutex there can deadlock against
+    // Run() calling into libjuice while holding it).
+    struct AgentContext {
+        Ice_Transport *self = nullptr;
+        uint64 peer_id = 0;
+        juice_agent_t *agent = nullptr;
+    };
+
+    // Events queued by libjuice callbacks and processed on the network thread
+    // inside Run() under the transport mutex.
+    struct JuiceEvent {
+        enum class Kind {
+            StateChanged,
+            Candidate,
+            Recv,
+        } kind = Kind::StateChanged;
+        uint64 peer_id = 0;
+        juice_state_t state = JUICE_STATE_DISCONNECTED;
+        std::string payload{}; // candidate SDP or received datagram bytes
+    };
+
     // ---- libjuice callbacks (run on the agent threads) ----
     static void juice_state_changed(juice_agent_t *agent, juice_state_t state, void *user_ptr);
     static void juice_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr);
@@ -113,6 +138,7 @@ private:
     void ws_state_handler(bool connected);
 
     void process_ws_message_locked(const std::string &payload);
+    void process_juice_events_locked();
     void ensure_agent_locked(uint64 peer_id, const std::string &signaling_id);
     juice_agent_t *create_agent_locked(uint64 peer_id);
     void queue_agent_destroy_locked(juice_agent_t *agent);
@@ -166,11 +192,15 @@ private:
     std::map<uint64, Peer> peers{};                    // by primary id
     std::map<uint64, uint64> peer_by_alias{};          // announced steamid -> primary id
     std::map<uint32, uint64> peer_by_virtual_ip{};     // virtual ip -> primary id
-    std::map<juice_agent_t *, uint64> agent_to_peer{}; // agent -> primary id
-    std::deque<juice_agent_t *> destroy_queue{};       // agents to destroy outside the lock
+    std::map<juice_agent_t *, AgentContext *> agent_ctx{}; // agent -> per-agent context
+    std::deque<AgentContext *> destroy_queue{};        // contexts to destroy outside the lock
 
     std::deque<InboundPacket> inbound_packets{};
     std::deque<DisconnectEvent> disconnect_events{};
+
+    // Events pushed by libjuice callbacks (agent threads) and drained by Run().
+    std::deque<JuiceEvent> juice_events{};
+    std::mutex juice_events_mutex{};
 
     std::recursive_mutex mutex{};
 };

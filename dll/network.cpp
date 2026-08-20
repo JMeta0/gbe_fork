@@ -687,6 +687,7 @@ void Networking::ice_mark_peer_online(Common_Message *msg, IP_PORT ip_port)
     conn->connected = true;
 
     if (notify_online) {
+        PRINT_DEBUG("ice peer online id=%llu appid=%u", static_cast<unsigned long long>(source_id.ConvertToUint64()), msg_appid);
         run_callback_user(source_id, true, msg_appid);
     }
 }
@@ -1128,6 +1129,7 @@ void Networking::send_announce_broadcasts()
 
 void Networking::Run()
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
     double time_extra = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_run).count();
     last_run = now;
@@ -1397,6 +1399,7 @@ void Networking::Run()
 
 void Networking::addListenId(CSteamID id)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     if (!enabled) return;
     auto i = std::find(ids.begin(), ids.end(), id);
     if (i != ids.end()) {
@@ -1414,6 +1417,7 @@ void Networking::addListenId(CSteamID id)
 
 void Networking::setAppID(uint32 appid)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     this->appid = appid;
     if (ice_transport) {
         ice_transport->set_appid(appid);
@@ -1511,16 +1515,22 @@ bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
 
 bool Networking::sendToAllIndividuals(Common_Message *msg, bool reliable)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    bool sent_any = false;
+    bool all_sent = true;
     for (auto &conn: connections) {
         for (auto &steam_id : conn.ids) {
             if (steam_id.BIndividualAccount()) {
+                sent_any = true;
                 msg->set_dest_id(steam_id.ConvertToUint64());
-                sendTo(msg, reliable, &conn);
+                if (!sendTo(msg, reliable, &conn)) {
+                    all_sent = false;
+                }
             }
         }
     }
 
-    return true;
+    return sent_any && all_sent;
 }
 
 bool Networking::sendToAllGameservers(Common_Message *msg, bool reliable)

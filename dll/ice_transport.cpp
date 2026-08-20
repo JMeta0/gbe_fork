@@ -197,24 +197,29 @@ Ice_Transport::Ice_Transport(
 
 Ice_Transport::~Ice_Transport()
 {
-    std::vector<juice_agent_t *> to_destroy{};
+    std::vector<AgentContext *> to_destroy{};
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         ws.disconnect();
         for (auto &[id, peer] : peers) {
-            if (peer.agent) to_destroy.push_back(peer.agent);
+            if (peer.agent) {
+                auto it = agent_ctx.find(peer.agent);
+                if (it != agent_ctx.end()) to_destroy.push_back(it->second);
+            }
         }
-        for (auto *agent : destroy_queue) {
-            if (agent) to_destroy.push_back(agent);
+        for (auto *ctx : destroy_queue) {
+            if (ctx) to_destroy.push_back(ctx);
         }
         destroy_queue.clear();
         peers.clear();
         peer_by_alias.clear();
         peer_by_virtual_ip.clear();
-        agent_to_peer.clear();
+        agent_ctx.clear();
     }
-    for (auto *agent : to_destroy) {
-        if (agent) juice_destroy(agent);
+    for (auto *ctx : to_destroy) {
+        if (!ctx) continue;
+        if (ctx->agent) juice_destroy(ctx->agent);
+        delete ctx;
     }
 }
 
@@ -345,6 +350,20 @@ void Ice_Transport::ws_state_handler(bool connected)
         ws_connected = false;
         list_requested = false;
         next_connect_attempt = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+
+        // Candidates and descriptions sent while signaling is down cannot be
+        // replayed by the WebSocket client. Recreate peers that never reached
+        // ICE connected so the next peer list starts a fresh negotiation.
+        std::vector<uint64> incomplete_peers{};
+        for (const auto &[peer_id, peer] : peers) {
+            if (!peer.connected) {
+                incomplete_peers.push_back(peer_id);
+            }
+        }
+        for (uint64 peer_id : incomplete_peers) {
+            remove_peer_locked(peer_id, false);
+        }
+
         PRINT_DEBUG("ice signaling disconnected");
     }
 }
@@ -362,6 +381,8 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
 
     std::string type = json.value("type", "");
     if (type == "list") {
+        size_t peer_count = json.contains("peer_ids") && json["peer_ids"].is_array() ? json["peer_ids"].size() : 0;
+        PRINT_DEBUG("ice signaling list peers=%zu", peer_count);
         if (json.contains("peer_ids") && json["peer_ids"].is_array()) {
             for (const auto &item : json["peer_ids"]) {
                 if (!item.is_string()) continue;
@@ -375,12 +396,14 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
     } else if (type == "peer_connected") {
         std::string id_str = json.value("peer_id", "");
         uint64 peer_id = parse_peer_id(id_str);
+        PRINT_DEBUG("ice signaling peer connected peer=%llu id='%s'", static_cast<unsigned long long>(peer_id), id_str.c_str());
         if (peer_id != 0 && peer_id != primary_id()) {
             ensure_agent_locked(peer_id, id_str);
         }
     } else if (type == "peer_disconnected") {
         std::string id_str = json.value("peer_id", "");
         uint64 peer_id = parse_peer_id(id_str);
+        PRINT_DEBUG("ice signaling peer disconnected peer=%llu id='%s'", static_cast<unsigned long long>(peer_id), id_str.c_str());
         if (peer_id != 0) {
             remove_peer_locked(peer_id, true);
         }
@@ -469,6 +492,9 @@ void Ice_Transport::handle_candidate_locked(uint64 peer_id, const std::string &c
 
 void Ice_Transport::send_candidate_locked(Peer &peer, const char *sdp)
 {
+    // The candidate callback can run synchronously while create_agent_locked()
+    // is still assigning Peer::agent. The per-agent context already validated
+    // the source agent, so do not require Peer::agent here.
     if (!ws_connected) return;
     nlohmann::json json;
     json["type"] = "candidate";
@@ -501,19 +527,31 @@ void Ice_Transport::ensure_agent_locked(uint64 peer_id, const std::string &signa
         return;
     }
 
+    // Insert the peer before gathering. libjuice emits host candidates and a
+    // CONNECTING state synchronously from juice_gather_candidates(), and the
+    // callbacks need to find this Peer in order to forward those candidates.
     Peer peer{};
     peer.primary_id = peer_id;
     peer.signaling_id = signaling_id;
     peer.virtual_ip = derive_virtual_ip(peer_id);
     peer.virtual_port = derive_virtual_port(peer_id);
-    peer.agent = create_agent_locked(peer_id);
-    peers[peer_id] = std::move(peer);
-    peer_by_virtual_ip[peers[peer_id].virtual_ip] = peer_id;
-    PRINT_DEBUG("ice agent created peer=%llu virtual=%u:%u", static_cast<unsigned long long>(peer_id), peers[peer_id].virtual_ip, peers[peer_id].virtual_port);
+    auto [peer_it, inserted] = peers.emplace(peer_id, std::move(peer));
+    if (!inserted) return;
 
-    if (peers[peer_id].agent && !peers[peer_id].description_sent) {
-        peers[peer_id].description_sent = true;
-        send_description_locked(peers[peer_id], "offer");
+    Peer &new_peer = peer_it->second;
+    peer_by_virtual_ip[new_peer.virtual_ip] = peer_id;
+    new_peer.agent = create_agent_locked(peer_id);
+    if (!new_peer.agent) {
+        peer_by_virtual_ip.erase(new_peer.virtual_ip);
+        peers.erase(peer_it);
+        return;
+    }
+
+    PRINT_DEBUG("ice agent created peer=%llu virtual=%u:%u", static_cast<unsigned long long>(peer_id), new_peer.virtual_ip, new_peer.virtual_port);
+
+    if (!new_peer.description_sent) {
+        new_peer.description_sent = true;
+        send_description_locked(new_peer, "offer");
     }
 }
 
@@ -539,25 +577,36 @@ juice_agent_t *Ice_Transport::create_agent_locked(uint64 peer_id)
     config.cb_candidate = &Ice_Transport::juice_candidate;
     config.cb_gathering_done = &Ice_Transport::juice_gathering_done;
     config.cb_recv = &Ice_Transport::juice_recv;
-    config.user_ptr = this;
+
+    // Per-agent context so the callbacks (which run on the juice agent thread
+    // while libjuice holds its per-agent lock) can find the peer without
+    // taking the transport mutex. Freed after juice_destroy() below, which
+    // joins the agent thread so no callback can outlive the context.
+    auto *ctx = new AgentContext{};
+    ctx->self = this;
+    ctx->peer_id = peer_id;
+    config.user_ptr = ctx;
 
     juice_agent_t *agent = juice_create(&config);
     if (!agent) {
+        delete ctx;
         PRINT_DEBUG("ice juice_create failed");
         return nullptr;
     }
+    ctx->agent = agent;
 
-    // Register the agent->peer mapping BEFORE gathering: libjuice fires the
+    // Register the agent->context mapping BEFORE gathering: libjuice fires the
     // cb_candidate (host candidates) and the CONNECTING state change
     // synchronously inside juice_gather_candidates(), so the callbacks would
     // otherwise find no mapping and drop them (only the later srflx/relay
     // candidates from the agent thread would survive).
-    agent_to_peer[agent] = peer_id;
+    agent_ctx[agent] = ctx;
 
     if (juice_gather_candidates(agent) < 0) {
         PRINT_DEBUG("ice juice_gather_candidates failed");
-        agent_to_peer.erase(agent);
+        agent_ctx.erase(agent);
         juice_destroy(agent);
+        delete ctx;
         return nullptr;
     }
     return agent;
@@ -566,23 +615,27 @@ juice_agent_t *Ice_Transport::create_agent_locked(uint64 peer_id)
 void Ice_Transport::queue_agent_destroy_locked(juice_agent_t *agent)
 {
     if (!agent) return;
-    agent_to_peer.erase(agent);
-    destroy_queue.push_back(agent);
+    auto it = agent_ctx.find(agent);
+    if (it == agent_ctx.end()) return;
+    AgentContext *ctx = it->second;
+    agent_ctx.erase(it);
+    destroy_queue.push_back(ctx);
 }
 
 void Ice_Transport::destroy_queued_agents()
 {
     while (true) {
-        juice_agent_t *agent = nullptr;
+        AgentContext *ctx = nullptr;
         {
             std::lock_guard<std::recursive_mutex> lock(mutex);
             if (destroy_queue.empty()) return;
-            agent = destroy_queue.front();
+            ctx = destroy_queue.front();
             destroy_queue.pop_front();
         }
-        // destroyed outside the lock: juice_destroy joins the agent thread,
-        // which may be blocked on our mutex inside a callback
-        if (agent) juice_destroy(agent);
+        // destroyed outside the lock: juice_destroy joins the agent thread
+        if (!ctx) continue;
+        if (ctx->agent) juice_destroy(ctx->agent);
+        delete ctx;
     }
 }
 
@@ -620,48 +673,29 @@ void Ice_Transport::remove_peer_locked(uint64 primary_id, bool notify_disconnect
 
 void Ice_Transport::juice_state_changed(juice_agent_t *agent, juice_state_t state, void *user_ptr)
 {
-    auto *self = static_cast<Ice_Transport *>(user_ptr);
-    std::lock_guard<std::recursive_mutex> lock(self->mutex);
-    auto ait = self->agent_to_peer.find(agent);
-    if (ait == self->agent_to_peer.end()) return;
-    uint64 primary = ait->second;
-    auto pit = self->peers.find(primary);
-    if (pit == self->peers.end()) return;
-    Peer &peer = pit->second;
-
-    switch (state) {
-    case JUICE_STATE_CONNECTED:
-    case JUICE_STATE_COMPLETED:
-        if (!peer.connected) {
-            peer.connected = true;
-            self->has_new_connection = true;
-            PRINT_DEBUG("ice peer connected peer=%llu state=%s", static_cast<unsigned long long>(primary), state == JUICE_STATE_COMPLETED ? "completed" : "connected");
-        }
-        break;
-    case JUICE_STATE_FAILED:
-    case JUICE_STATE_DISCONNECTED:
-        if (state == JUICE_STATE_FAILED) {
-            PRINT_DEBUG("ice peer failed peer=%llu", static_cast<unsigned long long>(primary));
-        } else {
-            PRINT_DEBUG("ice peer disconnected peer=%llu", static_cast<unsigned long long>(primary));
-        }
-        self->remove_peer_locked(primary, true);
-        break;
-    default:
-        PRINT_DEBUG("ice peer state peer=%llu state=%u", static_cast<unsigned long long>(primary), static_cast<unsigned>(state));
-        break;
-    }
+    auto *ctx = static_cast<AgentContext *>(user_ptr);
+    if (!ctx || !ctx->self) return;
+    JuiceEvent ev{};
+    ev.kind = JuiceEvent::Kind::StateChanged;
+    ev.peer_id = ctx->peer_id;
+    ev.state = state;
+    // Never take the transport mutex here: libjuice invokes this callback
+    // while holding its per-agent lock, and Run() calls into libjuice while
+    // holding the transport mutex -> ABBA deadlock.
+    std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
+    ctx->self->juice_events.push_back(std::move(ev));
 }
 
 void Ice_Transport::juice_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr)
 {
-    auto *self = static_cast<Ice_Transport *>(user_ptr);
-    std::lock_guard<std::recursive_mutex> lock(self->mutex);
-    auto ait = self->agent_to_peer.find(agent);
-    if (ait == self->agent_to_peer.end()) return;
-    auto pit = self->peers.find(ait->second);
-    if (pit == self->peers.end()) return;
-    self->send_candidate_locked(pit->second, sdp);
+    auto *ctx = static_cast<AgentContext *>(user_ptr);
+    if (!ctx || !ctx->self || !sdp) return;
+    JuiceEvent ev{};
+    ev.kind = JuiceEvent::Kind::Candidate;
+    ev.peer_id = ctx->peer_id;
+    ev.payload = sdp;
+    std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
+    ctx->self->juice_events.push_back(std::move(ev));
 }
 
 void Ice_Transport::juice_gathering_done(juice_agent_t * /*agent*/, void * /*user_ptr*/)
@@ -671,13 +705,66 @@ void Ice_Transport::juice_gathering_done(juice_agent_t * /*agent*/, void * /*use
 
 void Ice_Transport::juice_recv(juice_agent_t *agent, const char *data, size_t size, void *user_ptr)
 {
-    auto *self = static_cast<Ice_Transport *>(user_ptr);
-    std::lock_guard<std::recursive_mutex> lock(self->mutex);
-    auto ait = self->agent_to_peer.find(agent);
-    if (ait == self->agent_to_peer.end()) return;
-    auto pit = self->peers.find(ait->second);
-    if (pit == self->peers.end()) return;
-    self->handle_ice_packet_locked(pit->second, std::vector<char>(data, data + size));
+    auto *ctx = static_cast<AgentContext *>(user_ptr);
+    if (!ctx || !ctx->self || !data || size == 0) return;
+    JuiceEvent ev{};
+    ev.kind = JuiceEvent::Kind::Recv;
+    ev.peer_id = ctx->peer_id;
+    ev.payload.assign(data, data + size);
+    std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
+    ctx->self->juice_events.push_back(std::move(ev));
+}
+
+void Ice_Transport::process_juice_events_locked()
+{
+    std::deque<JuiceEvent> events{};
+    {
+        // Leaf lock: held only for the swap, never while calling into libjuice
+        // or while holding the transport mutex across a libjuice call.
+        std::lock_guard<std::mutex> qlock(juice_events_mutex);
+        events.swap(juice_events);
+    }
+
+    for (const auto &ev : events) {
+        auto pit = peers.find(ev.peer_id);
+        if (pit == peers.end()) continue;
+        Peer &peer = pit->second;
+
+        switch (ev.kind) {
+        case JuiceEvent::Kind::StateChanged:
+            switch (ev.state) {
+            case JUICE_STATE_CONNECTED:
+            case JUICE_STATE_COMPLETED:
+                if (!peer.connected) {
+                    peer.connected = true;
+                    has_new_connection = true;
+                    PRINT_DEBUG("ice peer connected peer=%llu state=%s", static_cast<unsigned long long>(ev.peer_id), ev.state == JUICE_STATE_COMPLETED ? "completed" : "connected");
+                }
+                break;
+            case JUICE_STATE_FAILED:
+            case JUICE_STATE_DISCONNECTED:
+                if (ev.state == JUICE_STATE_FAILED) {
+                    PRINT_DEBUG("ice peer failed peer=%llu", static_cast<unsigned long long>(ev.peer_id));
+                } else {
+                    PRINT_DEBUG("ice peer disconnected peer=%llu", static_cast<unsigned long long>(ev.peer_id));
+                }
+                remove_peer_locked(ev.peer_id, true);
+                break;
+            default:
+                PRINT_DEBUG("ice peer state peer=%llu state=%u", static_cast<unsigned long long>(ev.peer_id), static_cast<unsigned>(ev.state));
+                break;
+            }
+            break;
+
+        case JuiceEvent::Kind::Candidate:
+            send_candidate_locked(peer, ev.payload.c_str());
+            break;
+
+        case JuiceEvent::Kind::Recv:
+            handle_ice_packet_locked(peer, std::vector<char>(ev.payload.begin(), ev.payload.end()));
+            break;
+        }
+    }
 }
 
 // ---- reliability / fragmentation layer ----
@@ -1005,6 +1092,11 @@ void Ice_Transport::Run()
         std::lock_guard<std::recursive_mutex> lock(mutex);
         if (!enabled()) return;
 
+        // Drain libjuice callback events (state changes, gathered candidates,
+        // received datagrams) first so connection/data events are not delayed
+        // by signaling traffic.
+        process_juice_events_locked();
+
         auto now = std::chrono::steady_clock::now();
         if (!ws_connected && !ws.is_connecting() && now >= next_connect_attempt) {
             next_connect_attempt = now + std::chrono::seconds(2);
@@ -1028,7 +1120,7 @@ void Ice_Transport::Run()
         send_pending_reliable_locked();
     }
 
-    // juice_destroy joins the agent thread, which may be blocked on our mutex
-    // inside a callback, so agents are destroyed without holding the lock.
+    // juice_destroy joins the agent thread, which may still be executing a
+    // callback, so agents are destroyed without holding the lock.
     destroy_queued_agents();
 }

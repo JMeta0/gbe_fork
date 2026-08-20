@@ -1445,7 +1445,7 @@ void Steam_Friends::RunCallbacks()
         resend_friend_data();
     }
 
-    if (modified) {
+    if (modified && check_timedout(last_sent_friends, SEND_FRIEND_RATE)) {
 	    PRINT_DEBUG("sending modified data");
         Common_Message msg;
         msg.set_source_id(settings->get_local_steam_id().ConvertToUint64());
@@ -1455,9 +1455,13 @@ void Steam_Friends::RunCallbacks()
         f->set_appid(settings->get_local_game_id().AppID());
         f->set_lobby_id(settings->get_lobby().ConvertToUint64());
         msg.set_allocated_friend_(f);
-        network->sendToAllIndividuals(&msg, true);
-        modified = false;
+        bool sent = network->sendToAllIndividuals(&msg, true);
         last_sent_friends = std::chrono::high_resolution_clock::now();
+        if (sent) {
+            modified = false;
+        } else {
+            PRINT_DEBUG("friend data send deferred until a peer is reachable");
+        }
     }
 }
 

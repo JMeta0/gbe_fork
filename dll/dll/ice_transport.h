@@ -41,6 +41,11 @@ public:
         std::vector<CSteamID> ids{};
         uint32 virtual_ip = 0;
         uint16 virtual_port = 0;
+        // True when the session was re-negotiated (peer restarted the game and
+        // re-registered on signaling). The peer itself did not go away: the
+        // network layer must keep the connection/friend entry and only re-mark
+        // it offline so the next data packet re-fires CONNECT.
+        bool session_reset = false;
     };
 
     struct PendingPacket {
@@ -78,6 +83,11 @@ public:
         std::deque<uint32> completed_messages{};
         std::set<uint32> completed_message_set{};
         std::chrono::steady_clock::time_point last_seen{};
+        // Set when signaling reports this peer disconnected while its ICE
+        // session is still up; cleared by any incoming ICE activity or a
+        // re-registration. After ICE_DISCONNECT_GRACE_SEC without either, the
+        // peer is presumed gone and removed (fast friend-list cleanup).
+        std::chrono::steady_clock::time_point signal_disconnected_at{};
     };
 
     Ice_Transport(
@@ -96,7 +106,7 @@ public:
     bool SendToEndpoint(Common_Message *msg, uint32 ip, uint16 port, bool reliable);
     bool SendBroadcast(Common_Message *msg);
     bool PollPacket(Common_Message *msg, IP_PORT *ip_port, bool *reliable);
-    bool PollDisconnect(std::vector<CSteamID> &ids, uint32 &virtual_ip, uint16 &virtual_port);
+    bool PollDisconnect(std::vector<CSteamID> &ids, uint32 &virtual_ip, uint16 &virtual_port, bool &session_reset);
     bool poll_new_connection();
     void request_list();
     uint32 virtual_ip();
@@ -123,6 +133,12 @@ private:
             Recv,
         } kind = Kind::StateChanged;
         uint64 peer_id = 0;
+        // The agent that produced this event. During an ICE restart the old
+        // agent is replaced; events it queued before destruction must not be
+        // applied to the new session, so process_juice_events_locked() skips
+        // events whose agent differs from the peer's current one. The pointer
+        // is only compared, never dereferenced.
+        juice_agent_t *agent = nullptr;
         juice_state_t state = JUICE_STATE_DISCONNECTED;
         std::string payload{}; // candidate SDP or received datagram bytes
     };
@@ -151,6 +167,7 @@ private:
     uint64 parse_peer_id(const std::string &value) const;
 
     void handle_description_locked(uint64 peer_id, const std::string &sdp, bool is_offer);
+    void restart_agent_locked(uint64 peer_id, const std::string &offer_sdp);
     void send_description_locked(Peer &peer, const char *type);
     void handle_candidate_locked(uint64 peer_id, const std::string &candidate);
     void send_candidate_locked(Peer &peer, const char *sdp);

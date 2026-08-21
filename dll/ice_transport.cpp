@@ -22,6 +22,11 @@ constexpr uint32 ICE_FLAG_RELIABLE = 1u << 0;
 constexpr size_t ICE_FRAGMENT_MTU = 1100;
 constexpr int ICE_RELIABLE_RETRY_MS = 250;
 constexpr size_t MAX_PENDING_RELIABLE = 256;
+// How long to keep an established ICE session after signaling reports the peer
+// disconnected before presuming it gone. Peers broadcast announces every ~5s,
+// so any live peer clears the grace flag well within this window; a process
+// that quit stays silent and is removed (friend list updated) shortly after.
+constexpr double ICE_DISCONNECT_GRACE_SEC = 8.0;
 
 struct IceHeader {
     uint8 version = ICE_VERSION;
@@ -399,6 +404,12 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
         uint64 peer_id = parse_peer_id(id_str);
         PRINT_DEBUG("ice signaling peer connected peer=%llu id='%s'", static_cast<unsigned long long>(peer_id), id_str.c_str());
         if (peer_id != 0 && peer_id != primary_id()) {
+            auto pit = peers.find(peer_id);
+            if (pit != peers.end()) {
+                // The peer re-registered on signaling (e.g. it restarted the
+                // game): it is clearly still alive, cancel any disconnect grace.
+                pit->second.signal_disconnected_at = {};
+            }
             ensure_agent_locked(peer_id, id_str);
         }
     } else if (type == "peer_disconnected") {
@@ -411,11 +422,15 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
                 // The signaling channel is only needed for ICE negotiation. Once a
                 // session is established the data path is independent of it, so a
                 // signaling drop (websocket blip, hub write-deadline close, NAT idle
-                // timeout) does not mean the peer went away. Keep the session up and
-                // let libjuice's consent freshness be the liveness authority: if the
-                // data path really died, the nominated pair fails and we get
-                // JUICE_STATE_FAILED/DISCONNECTED within CONSENT_TIMEOUT.
-                PRINT_DEBUG("ice signaling peer disconnected ignored peer=%llu (established ICE session)", static_cast<unsigned long long>(peer_id));
+                // timeout) does not mean the peer went away. Keep the session up,
+                // but arm a short grace: if the peer neither sends data nor
+                // re-registers (i.e. it actually quit), Run() removes it after
+                // ICE_DISCONNECT_GRACE_SEC so the friend list updates quickly
+                // instead of waiting for libjuice's consent timeout.
+                if (pit->second.signal_disconnected_at == std::chrono::steady_clock::time_point{}) {
+                    pit->second.signal_disconnected_at = std::chrono::steady_clock::now();
+                }
+                PRINT_DEBUG("ice signaling peer disconnected ignored peer=%llu (established ICE session, grace armed)", static_cast<unsigned long long>(peer_id));
             } else {
                 remove_peer_locked(peer_id, true);
             }
@@ -446,6 +461,28 @@ void Ice_Transport::handle_description_locked(uint64 peer_id, const std::string 
     Peer &peer = pit->second;
     std::string preview = sdp.size() > 96 ? sdp.substr(0, 96) + "..." : sdp;
     PRINT_DEBUG("ice remote %s peer=%llu sdp='%s'", is_offer ? "offer" : "answer", static_cast<unsigned long long>(peer_id), preview.c_str());
+
+    peer.signal_disconnected_at = {};
+
+    if (is_offer && peer.remote_description_set) {
+        // We already negotiated this peer. Applying the new offer in place:
+        // libjuice ignores an identical remote description (retransmitted
+        // offer -> JUICE_ERR_SUCCESS) and rejects a genuinely new one
+        // (JUICE_ERR_FAILED, "ICE restart is not supported"). Only the latter
+        // means the peer restarted (new registration, fresh credentials), so
+        // replace the agent and re-negotiate. The crossed-offer / glare case
+        // (remote not set yet) is intentionally NOT restarted: both sides
+        // offer on first discovery and libjuice connects them via the
+        // connectivity checks without answers.
+        int res = juice_set_remote_description(peer.agent, sdp.c_str());
+        if (res == JUICE_ERR_FAILED) {
+            restart_agent_locked(peer_id, sdp);
+        } else if (res == JUICE_ERR_SUCCESS) {
+            PRINT_DEBUG("ice duplicate offer ignored peer=%llu", static_cast<unsigned long long>(peer_id));
+        }
+        return;
+    }
+
     if (juice_set_remote_description(peer.agent, sdp.c_str()) < 0) {
         PRINT_DEBUG("ice set remote description failed peer=%llu", static_cast<unsigned long long>(peer_id));
     } else {
@@ -463,6 +500,77 @@ void Ice_Transport::handle_description_locked(uint64 peer_id, const std::string 
         peer.description_sent = true;
         send_description_locked(peer, "answer");
     }
+}
+
+void Ice_Transport::restart_agent_locked(uint64 peer_id, const std::string &offer_sdp)
+{
+    auto pit = peers.find(peer_id);
+    if (pit == peers.end()) return;
+    Peer &peer = pit->second;
+    PRINT_DEBUG("ice restart peer=%llu", static_cast<unsigned long long>(peer_id));
+
+    // A re-negotiated session supersedes the old one: the peer's previous
+    // process is gone (this offer came from a fresh registration), so its old
+    // agent is dead even though we never saw it fail. Reset all per-session
+    // state but keep the peer entry (ids, virtual endpoints, aliases).
+    bool was_connected = peer.connected;
+    peer.pending.clear();
+    peer.reassembly.clear();
+    peer.completed_messages.clear();
+    peer.completed_message_set.clear();
+    peer.next_packet_seq = 1;
+    peer.highest_remote_seq = 0;
+    peer.remote_ack_bits = 0;
+    peer.next_message_id = 1;
+    // pending_remote_candidates is kept: they are replayed once the new agent
+    // has the new remote description (and survive a create failure).
+    peer.remote_description_set = false;
+    peer.description_sent = false;
+    peer.connected = false;
+    peer.signal_disconnected_at = {};
+
+    if (was_connected) {
+        // The peer did not go away (it re-negotiated), so do not fire a real
+        // disconnect. Notify the network layer so it re-marks the connection
+        // offline: the first data packet of the new session then re-fires the
+        // CONNECT callback, which re-pushes our friend data to the peer. This
+        // is emitted before the replacement agent is created so the connection
+        // is re-marked offline even if agent creation fails below.
+        DisconnectEvent ev{};
+        if (!peer.ids.empty()) {
+            ev.ids.reserve(peer.ids.size());
+            for (uint64 id : peer.ids) {
+                ev.ids.emplace_back(CSteamID(id));
+            }
+        } else {
+            ev.ids.emplace_back(CSteamID(peer_id));
+        }
+        ev.virtual_ip = peer.virtual_ip;
+        ev.virtual_port = peer.virtual_port;
+        ev.session_reset = true;
+        disconnect_events.push_back(std::move(ev));
+        PRINT_DEBUG("ice peer session restarted peer=%llu ids=%zu", static_cast<unsigned long long>(peer_id), ev.ids.size());
+    }
+
+    if (peer.agent) {
+        queue_agent_destroy_locked(peer.agent);
+    }
+    peer.agent = create_agent_locked(peer_id);
+    if (!peer.agent) return;
+
+    if (juice_set_remote_description(peer.agent, offer_sdp.c_str()) < 0) {
+        PRINT_DEBUG("ice set remote description failed (restart) peer=%llu", static_cast<unsigned long long>(peer_id));
+        return;
+    }
+    peer.remote_description_set = true;
+    for (const auto &cand : peer.pending_remote_candidates) {
+        if (juice_add_remote_candidate(peer.agent, cand.c_str()) < 0) {
+            PRINT_DEBUG("ice add remote candidate failed (restart) peer=%llu", static_cast<unsigned long long>(peer_id));
+        }
+    }
+    peer.pending_remote_candidates.clear();
+    peer.description_sent = true;
+    send_description_locked(peer, "answer");
 }
 
 void Ice_Transport::send_description_locked(Peer &peer, const char *type)
@@ -493,6 +601,7 @@ void Ice_Transport::handle_candidate_locked(uint64 peer_id, const std::string &c
     Peer &peer = pit->second;
     std::string preview = candidate.size() > 96 ? candidate.substr(0, 96) + "..." : candidate;
     PRINT_DEBUG("ice remote candidate peer=%llu sdp='%s'", static_cast<unsigned long long>(peer_id), preview.c_str());
+    peer.signal_disconnected_at = {};
     if (!peer.remote_description_set) {
         PRINT_DEBUG("ice buffering candidate pending remote description peer=%llu", static_cast<unsigned long long>(peer_id));
         peer.pending_remote_candidates.push_back(candidate);
@@ -691,6 +800,7 @@ void Ice_Transport::juice_state_changed(juice_agent_t *agent, juice_state_t stat
     JuiceEvent ev{};
     ev.kind = JuiceEvent::Kind::StateChanged;
     ev.peer_id = ctx->peer_id;
+    ev.agent = agent;
     ev.state = state;
     // Never take the transport mutex here: libjuice invokes this callback
     // while holding its per-agent lock, and Run() calls into libjuice while
@@ -706,6 +816,7 @@ void Ice_Transport::juice_candidate(juice_agent_t *agent, const char *sdp, void 
     JuiceEvent ev{};
     ev.kind = JuiceEvent::Kind::Candidate;
     ev.peer_id = ctx->peer_id;
+    ev.agent = agent;
     ev.payload = sdp;
     std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
     ctx->self->juice_events.push_back(std::move(ev));
@@ -723,6 +834,7 @@ void Ice_Transport::juice_recv(juice_agent_t *agent, const char *data, size_t si
     JuiceEvent ev{};
     ev.kind = JuiceEvent::Kind::Recv;
     ev.peer_id = ctx->peer_id;
+    ev.agent = agent;
     ev.payload.assign(data, data + size);
     std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
     ctx->self->juice_events.push_back(std::move(ev));
@@ -742,6 +854,10 @@ void Ice_Transport::process_juice_events_locked()
         auto pit = peers.find(ev.peer_id);
         if (pit == peers.end()) continue;
         Peer &peer = pit->second;
+        // Skip events produced by a superseded agent (ICE restart replaced the
+        // peer's agent; events the old agent queued before destruction must not
+        // be applied to the new session). The pointer is only compared.
+        if (ev.agent != nullptr && ev.agent != peer.agent) continue;
 
         switch (ev.kind) {
         case JuiceEvent::Kind::StateChanged:
@@ -753,6 +869,10 @@ void Ice_Transport::process_juice_events_locked()
                     has_new_connection = true;
                     PRINT_DEBUG("ice peer connected peer=%llu state=%s", static_cast<unsigned long long>(ev.peer_id), ev.state == JUICE_STATE_COMPLETED ? "completed" : "connected");
                 }
+                // A connected session is proof of life; also covers the
+                // re-negotiated session of a restarted peer.
+                peer.last_seen = std::chrono::steady_clock::now();
+                peer.signal_disconnected_at = {};
                 break;
             case JUICE_STATE_FAILED:
             case JUICE_STATE_DISCONNECTED:
@@ -889,6 +1009,7 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
     if (!deserialize_ice_header(packet, header, payload)) return;
 
     peer.last_seen = std::chrono::steady_clock::now();
+    peer.signal_disconnected_at = {};
     if (header.source_id != 0) {
         peer_by_alias[header.source_id] = peer.primary_id;
     }
@@ -1085,7 +1206,7 @@ bool Ice_Transport::PollPacket(Common_Message *msg, IP_PORT *ip_port, bool *reli
     return true;
 }
 
-bool Ice_Transport::PollDisconnect(std::vector<CSteamID> &ids, uint32 &virtual_ip, uint16 &virtual_port)
+bool Ice_Transport::PollDisconnect(std::vector<CSteamID> &ids, uint32 &virtual_ip, uint16 &virtual_port, bool &session_reset)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (disconnect_events.empty()) return false;
@@ -1094,6 +1215,7 @@ bool Ice_Transport::PollDisconnect(std::vector<CSteamID> &ids, uint32 &virtual_i
     ids = std::move(event.ids);
     virtual_ip = event.virtual_ip;
     virtual_port = event.virtual_port;
+    session_reset = event.session_reset;
     return true;
 }
 
@@ -1145,6 +1267,26 @@ void Ice_Transport::Run()
             std::string payload = std::move(ws_inbox.front());
             ws_inbox.pop_front();
             process_ws_message_locked(payload);
+        }
+
+        // Fast liveness cleanup: a peer whose signaling channel dropped AND that
+        // has sent no ICE data since (a process that quit stays silent) is
+        // removed after the grace period so the friend list updates quickly.
+        // Any packet, offer/answer, candidate, or re-registration clears the
+        // flag, so a live peer with a websocket blip is never touched here.
+        {
+            std::vector<uint64> stale_peers{};
+            for (const auto &[peer_id, peer] : peers) {
+                if (peer.signal_disconnected_at != std::chrono::steady_clock::time_point{} &&
+                    now - peer.signal_disconnected_at > std::chrono::duration<double>(ICE_DISCONNECT_GRACE_SEC) &&
+                    now - peer.last_seen > std::chrono::duration<double>(ICE_DISCONNECT_GRACE_SEC)) {
+                    stale_peers.push_back(peer_id);
+                }
+            }
+            for (uint64 peer_id : stale_peers) {
+                PRINT_DEBUG("ice peer removed after signaling disconnect grace peer=%llu", static_cast<unsigned long long>(peer_id));
+                remove_peer_locked(peer_id, true);
+            }
         }
 
         send_pending_reliable_locked();

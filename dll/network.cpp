@@ -749,8 +749,25 @@ void Networking::ice_dispatch_messages()
     std::vector<CSteamID> disconnected_ids{};
     uint32 disconnected_ip = 0;
     uint16 disconnected_port = 0;
-    while (ice_transport->PollDisconnect(disconnected_ids, disconnected_ip, disconnected_port)) {
-        ice_mark_peer_offline(disconnected_ids, disconnected_ip, disconnected_port);
+    bool session_reset = false;
+    while (ice_transport->PollDisconnect(disconnected_ids, disconnected_ip, disconnected_port, session_reset)) {
+        if (session_reset) {
+            // The peer re-negotiated a fresh ICE session (e.g. it restarted the
+            // game and re-registered on signaling). The peer itself did not go
+            // away: keep the connection and the friend entry, but mark it
+            // offline so the first data packet of the new session re-fires the
+            // CONNECT callback, which re-pushes our friend data to the peer.
+            for (const auto &id : disconnected_ids) {
+                for (auto &conn : connections) {
+                    if (std::find(conn.ids.begin(), conn.ids.end(), id) != conn.ids.end()) {
+                        conn.connected = false;
+                    }
+                }
+            }
+            trigger_ice_rediscovery("peer session restarted");
+        } else {
+            ice_mark_peer_offline(disconnected_ids, disconnected_ip, disconnected_port);
+        }
     }
 
     Common_Message msg{};

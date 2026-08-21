@@ -296,6 +296,15 @@ func (h *hub) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// The read loop below blocks until the connection dies, so without keepalive
+	// a NAT/proxy that silently drops an idle websocket would leave a zombie
+	// peer entry until the next write fails. Keepalive probes keep the mapping
+	// alive and surface dead peers quickly.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	upgrade := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +

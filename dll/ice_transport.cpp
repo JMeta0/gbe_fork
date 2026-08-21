@@ -21,6 +21,7 @@ constexpr uint8 ICE_PKT_ACK = 4;
 constexpr uint32 ICE_FLAG_RELIABLE = 1u << 0;
 constexpr size_t ICE_FRAGMENT_MTU = 1100;
 constexpr int ICE_RELIABLE_RETRY_MS = 250;
+constexpr size_t MAX_PENDING_RELIABLE = 256;
 
 struct IceHeader {
     uint8 version = ICE_VERSION;
@@ -405,7 +406,19 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
         uint64 peer_id = parse_peer_id(id_str);
         PRINT_DEBUG("ice signaling peer disconnected peer=%llu id='%s'", static_cast<unsigned long long>(peer_id), id_str.c_str());
         if (peer_id != 0) {
-            remove_peer_locked(peer_id, true);
+            auto pit = peers.find(peer_id);
+            if (pit != peers.end() && pit->second.connected) {
+                // The signaling channel is only needed for ICE negotiation. Once a
+                // session is established the data path is independent of it, so a
+                // signaling drop (websocket blip, hub write-deadline close, NAT idle
+                // timeout) does not mean the peer went away. Keep the session up and
+                // let libjuice's consent freshness be the liveness authority: if the
+                // data path really died, the nominated pair fails and we get
+                // JUICE_STATE_FAILED/DISCONNECTED within CONSENT_TIMEOUT.
+                PRINT_DEBUG("ice signaling peer disconnected ignored peer=%llu (established ICE session)", static_cast<unsigned long long>(peer_id));
+            } else {
+                remove_peer_locked(peer_id, true);
+            }
         }
     } else if (type == "offer" || type == "answer") {
         std::string id_str = json.value("source_id", "");
@@ -822,15 +835,30 @@ bool Ice_Transport::send_fragments_locked(Peer &peer, uint64 dest_id, const std:
         header.ack_bits = peer.remote_ack_bits;
 
         std::vector<char> bytes = serialize_ice_header(header, fragment);
-        if (juice_send(peer.agent, bytes.data(), bytes.size()) != JUICE_ERR_SUCCESS) {
-            return false;
-        }
 
         if (reliable) {
+            // Queue reliable fragments *before* the send attempt: a transient
+            // juice_send failure (TURN channel bind in progress, momentary missing
+            // selected entry, socket would-block) must not lose the message.
+            // send_pending_reliable_locked() retries queued fragments until ACKed.
             PendingPacket pending{};
-            pending.bytes = std::move(bytes);
+            pending.bytes = bytes;
             pending.next_send = now + std::chrono::milliseconds(ICE_RELIABLE_RETRY_MS);
             peer.pending[seq] = std::move(pending);
+
+            // Bound the backlog: evict the oldest fragment if a peer never ACKs
+            // (it is removed anyway once libjuice reports the session dead).
+            while (peer.pending.size() > MAX_PENDING_RELIABLE) {
+                auto oldest = peer.pending.begin();
+                if (oldest == peer.pending.end()) break;
+                peer.pending.erase(oldest);
+            }
+        }
+
+        if (juice_send(peer.agent, bytes.data(), bytes.size()) != JUICE_ERR_SUCCESS) {
+            if (!reliable) return false; // preserve fire-and-forget semantics
+            // Reliable fragments are queued above; the retry loop will deliver them.
+            continue;
         }
     }
     return true;
@@ -845,9 +873,11 @@ void Ice_Transport::send_pending_reliable_locked()
         for (auto &[seq, pending] : peer.pending) {
             (void)seq;
             if (now < pending.next_send) continue;
-            if (juice_send(peer.agent, pending.bytes.data(), pending.bytes.size()) == JUICE_ERR_SUCCESS) {
-                pending.next_send = now + std::chrono::milliseconds(ICE_RELIABLE_RETRY_MS);
-            }
+            // Advance the retry timestamp whether or not the send succeeded, so
+            // a persistently failing peer retries at the 250ms cadence instead
+            // of spinning at tick rate.
+            pending.next_send = now + std::chrono::milliseconds(ICE_RELIABLE_RETRY_MS);
+            juice_send(peer.agent, pending.bytes.data(), pending.bytes.size());
         }
     }
 }

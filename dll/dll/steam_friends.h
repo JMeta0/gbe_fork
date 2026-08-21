@@ -63,10 +63,13 @@ public ISteamFriends
     CSteamID lobby_id{};
 
     std::chrono::high_resolution_clock::time_point last_sent_friends{};
+    std::map<uint64, std::chrono::high_resolution_clock::time_point> last_friend_data_sent{};
     std::map<std::string, std::string> reg{};
     std::string reg_nullptr{};
 
     Friend *find_friend(CSteamID id);
+
+    void send_friend_data(CSteamID dest);
 
     void persona_change(CSteamID id, EPersonaChange flags);
 

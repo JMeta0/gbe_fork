@@ -119,6 +119,12 @@ class Networking
 
     std::vector<struct TCP_Socket> accepted;
     std::recursive_mutex mutex;
+    // Leaf lock guarding the ice_transport pointer + in-flight calls. API
+    // threads (which may hold other locks, e.g. Steam_Friends' global_mutex,
+    // while calling sendTo/sendToIPPort) must NOT take `mutex` — the network
+    // thread holds `mutex` across callback dispatch, which would invert the
+    // lock order and deadlock. This lock is only ever the last one acquired.
+    std::recursive_mutex ice_transport_mutex;
 
     struct Network_Callback_Container callbacks[CALLBACK_IDS_MAX];
     std::vector<Common_Message> local_send;

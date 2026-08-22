@@ -49,6 +49,10 @@ public:
     struct PendingPacket {
         std::vector<char> bytes{};
         std::chrono::steady_clock::time_point next_send{};
+        // Message this fragment belongs to. Fragments of one message get
+        // consecutive packet seqs, so they are contiguous in peer.pending;
+        // eviction uses this to drop whole messages atomically.
+        uint32 message_id = 0;
     };
 
     struct ReassemblyState {
@@ -120,6 +124,12 @@ private:
         Ice_Transport *self = nullptr;
         uint64 peer_id = 0;
         juice_agent_t *agent = nullptr;
+        // Gathered candidate type counts (filled by juice_candidate on the
+        // agent thread, summarized in juice_gathering_done) so a config with
+        // unreachable STUN/TURN is diagnosable from the debug log.
+        int host_candidates = 0;
+        int srflx_candidates = 0;
+        int relay_candidates = 0;
     };
 
     // Events queued by libjuice callbacks and processed on the network thread
@@ -201,6 +211,9 @@ private:
     bool client_identity_promoted = false; // add_listen_id promoted the client id to primary
     bool has_new_connection = false;
     std::chrono::steady_clock::time_point next_connect_attempt{};
+    // Exponential reconnect backoff for signaling: starts at 1s, doubles per
+    // failed attempt, capped at 30s; reset to 1s on a successful connect.
+    int reconnect_delay_ms = 1000;
     std::chrono::steady_clock::time_point next_list_poll{};
     std::deque<std::string> ws_inbox{};
 

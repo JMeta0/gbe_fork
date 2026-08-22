@@ -1506,6 +1506,9 @@ void Steam_Friends::Callback(Common_Message *msg)
         if (msg->low_level().type() == Low_Level::DISCONNECT) {
             PRINT_DEBUG("Disconnect");
             uint64 id = msg->source_id();
+            // The one-shot answer bookkeeping must not outlive the peer;
+            // otherwise the map grows forever across many short-lived peers.
+            last_friend_data_sent.erase(id);
             auto f = std::find_if(friends.begin(), friends.end(), [&id](Friend const& item) { return item.id() == id; });
             if (friends.end() != f) {
                 persona_change((uint64)f->id(), k_EPersonaChangeStatus);

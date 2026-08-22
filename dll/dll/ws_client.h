@@ -3,6 +3,7 @@
 
 #include "network.h"
 
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -81,6 +82,16 @@ private:
 
     // multi-frame message reassembly (continuation frames)
     std::string message_accum{};
+
+    // liveness / connect-deadline bookkeeping (steady clock)
+    std::chrono::steady_clock::time_point last_activity{}; // any complete frame received
+    std::chrono::steady_clock::time_point connect_started{}; // connect() initiated
+    std::chrono::steady_clock::time_point next_ping{};       // next ping we send while Open
+
+    // cached DNS result (network byte order) for the current host; cleared by
+    // configure() so a changed host is re-resolved
+    std::string resolved_host{};
+    uint32_t resolved_ip = 0;
 
     MessageCallback message_cb{};
     StateCallback state_cb{};

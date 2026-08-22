@@ -1055,6 +1055,11 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
 
 Networking::~Networking()
 {
+    // Serialize against the network thread (Run/addListenId/setAppID), which
+    // touches ice_transport while holding this mutex; the leaf lock below then
+    // waits for in-flight API-thread sends before the object is freed.
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+
     for (auto &c : connections) {
         kill_tcp_socket(c.tcp_socket_incoming);
         kill_tcp_socket(c.tcp_socket_outgoing);
@@ -1066,8 +1071,13 @@ Networking::~Networking()
 
     kill_socket(udp_socket);
     kill_socket(tcp_socket);
-    delete ice_transport;
-    ice_transport = nullptr;
+    {
+        // Leaf lock: an API thread may be inside ice_transport->Send() right
+        // now (holding this same lock); wait for it before freeing the object.
+        std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+        delete ice_transport;
+        ice_transport = nullptr;
+    }
 
     curl_global_cleanup();
 }
@@ -1444,7 +1454,12 @@ void Networking::setAppID(uint32 appid)
 bool Networking::sendToIPPort(Common_Message *msg, uint32 ip, uint16 port, bool reliable)
 {
     if (ice_transport) {
-        return ice_transport->SendToEndpoint(msg, ip, port, reliable);
+        // May be called from game threads while the destructor runs on the
+        // network thread; the leaf lock keeps ice_transport alive for the call.
+        std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+        if (ice_transport) {
+            return ice_transport->SendToEndpoint(msg, ip, port, reliable);
+        }
     }
 
     bool is_local_ip = ((ip >> 24) == 0x7F);
@@ -1506,7 +1521,13 @@ bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
     }
 
     if (!ret && ice_transport) {
-        ret = ice_transport->Send(msg, reliable);
+        // Leaf lock: game threads may hold other locks (Steam_Friends'
+        // global_mutex, ...) here, so this must never be the Networking mutex,
+        // which the network thread holds across callback dispatch.
+        std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+        if (ice_transport) {
+            ret = ice_transport->Send(msg, reliable);
+        }
     }
 
     if (!ret && conn) {

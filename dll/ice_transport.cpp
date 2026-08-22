@@ -9,7 +9,7 @@
 
 namespace {
 
-// ---- ICE datagram protocol (ported from the natpunch transport) ----
+// ---- ICE datagram protocol ----
 // The libjuice agent only provides an authenticated, connected datagram
 // channel. On top of it we keep the proven wire format for reliable delivery,
 // fragmentation and acknowledgment.
@@ -260,8 +260,7 @@ uint64 Ice_Transport::primary_id() const
 std::string Ice_Transport::peer_id_string(uint64 id) const
 {
     // appid is part of the signaling identity so two games running under the
-    // same steamid on the same signaling server stay isolated (the old relay
-    // broker keyed sessions by appid).
+    // same steamid on the same signaling server stay isolated.
     return std::to_string(appid) + "/" + std::to_string(id);
 }
 
@@ -1116,7 +1115,7 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
     inbound_packets.push_back(std::move(inbound));
 }
 
-// ---- public send / receive API (drop-in for the old relay transport) ----
+// ---- public send / receive API ----
 
 Ice_Transport::Peer *Ice_Transport::find_peer_locked(uint64 id)
 {

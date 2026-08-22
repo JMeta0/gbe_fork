@@ -717,7 +717,7 @@ void Networking::ice_mark_peer_offline(const std::vector<CSteamID> &peer_ids, ui
             uint16 current_port = ntohs(conn->tcp_ip_port.port);
             if (current_ip != disconnected_ip || current_port != disconnected_port) {
                 PRINT_DEBUG(
-                    "ignoring stale relay disconnect for ids=%zu disconnected=%u:%u current=%u:%u",
+                    "ignoring stale disconnect for ids=%zu disconnected=%u:%u current=%u:%u",
                     peer_ids.size(),
                     disconnected_ip,
                     disconnected_port,
@@ -803,7 +803,7 @@ void Networking::trigger_ice_rediscovery(const char *reason)
 
     last_ice_rediscovery = now;
     last_broadcast = std::chrono::high_resolution_clock::time_point{};
-    PRINT_DEBUG("relay rediscovery requested: %s", reason ? reason : "unknown");
+    PRINT_DEBUG("ice rediscovery requested: %s", reason ? reason : "unknown");
 
     if (ice_transport->ready()) {
         ice_transport->request_list();
@@ -1123,9 +1123,9 @@ void Networking::send_announce_broadcasts()
         bool sent = ice_transport->SendBroadcast(&msg);
         last_broadcast = std::chrono::high_resolution_clock::now();
         if (sent) {
-            PRINT_DEBUG("sent relay broadcasts");
+            PRINT_DEBUG("sent ice broadcasts");
         } else {
-            PRINT_DEBUG("relay broadcast skipped because relay transport is not ready");
+            PRINT_DEBUG("ice broadcast skipped because ice transport is not ready");
         }
         return;
     }
@@ -1645,7 +1645,7 @@ uint32 Networking::getOwnIP()
 void Networking::startQuery(IP_PORT ip_port)
 {
     if (ice_transport) {
-        PRINT_DEBUG("source query is unsupported in relay mode");
+        PRINT_DEBUG("source query is unsupported in ice mode");
         query_alive = false;
         return;
     }

@@ -14,8 +14,7 @@
 #include <string>
 #include <vector>
 
-// Internet transport for the emulator, replacing the old central relay broker
-// with a full ICE + STUN + TURN stack:
+// Internet transport for the emulator, built on a full ICE + STUN + TURN stack:
 //
 //   - WebSocket signaling (ice-stack/signaling.go) for peer rendezvous:
 //     ws://<signaling_host>:<signaling_port>/<peer-id>[?secret=...]
@@ -23,12 +22,11 @@
 //     checks: host candidates, server-reflexive candidates via STUN, and
 //     relayed candidates via TURN (the guaranteed path behind symmetric NAT)
 //   - a reliable/fragmentation layer on top of the ICE datagram channel for
-//     reliable Common_Messages (ported from the natpunch transport)
+//     reliable Common_Messages
 //
-// Peer addressing for the game keeps the relay semantics: each peer gets a
-// deterministic virtual IP:port derived from (appid, steamid), so getIP() /
-// getPort() / announce handling in network.cpp behave exactly as with the
-// broker-assigned endpoints.
+// Peer addressing for the game: each peer gets a deterministic virtual IP:port
+// derived from (appid, steamid), so getIP() / getPort() / announce handling in
+// network.cpp keep the same stable endpoints for the game.
 class Ice_Transport {
 public:
     struct InboundPacket {
@@ -172,7 +170,7 @@ private:
     void handle_candidate_locked(uint64 peer_id, const std::string &candidate);
     void send_candidate_locked(Peer &peer, const char *sdp);
 
-    // ---- reliability / fragmentation layer (ported from natpunch) ----
+    // ---- reliability / fragmentation layer ----
     bool send_ice_packet_locked(Peer &peer, uint8 type, uint32 flags, uint64 source_id, uint64 dest_id,
                                 uint32 packet_seq, uint32 message_id, uint16 fragment_index,
                                 uint16 fragment_count, const std::vector<char> &payload);

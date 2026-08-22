@@ -11,7 +11,7 @@
 // Minimal RFC 6455 WebSocket *client* used by the ICE transport to talk to the
 // signaling server (ice-stack/signaling.go, ws://host:port/<peer-id>[?secret=]).
 //
-// Threading model mirrors the relay transport: all socket I/O happens on the
+// Threading model: all socket I/O happens on the
 // network thread through Run(); send() may be called from any thread (e.g. the
 // libjuice agent thread) and only appends to an outbox.
 class WS_Client {

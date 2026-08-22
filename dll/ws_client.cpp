@@ -15,7 +15,7 @@ namespace {
 constexpr char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 constexpr uint64_t WS_MAX_FRAME_SIZE = 1ull << 20; // 1 MiB, mirroring the signaling server cap
 
-// ---- socket helpers (same style as the relay transport) ----
+// ---- socket helpers ----
 
 bool ws_socket_valid(sock_t sock)
 {

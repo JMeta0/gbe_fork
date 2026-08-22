@@ -27,6 +27,15 @@ constexpr size_t MAX_PENDING_RELIABLE = 256;
 // so any live peer clears the grace flag well within this window; a process
 // that quit stays silent and is removed (friend list updated) shortly after.
 constexpr double ICE_DISCONNECT_GRACE_SEC = 8.0;
+// How long an incomplete incoming message may sit in peer.reassembly before it
+// is garbage-collected. The sender retries every 250ms, so a partial message
+// that receives no fragment for this long is unrecoverable; keeping it would
+// only leak memory.
+constexpr double ICE_REASSEMBLY_GC_SEC = 10.0;
+// Upper bound for the libjuice callback event queue. While the network thread
+// is stalled (e.g. blocking DNS before the cache fix), callbacks keep queueing;
+// beyond this cap the oldest events are dropped so memory stays bounded.
+constexpr size_t MAX_JUICE_EVENTS = 1024;
 
 struct IceHeader {
     uint8 version = ICE_VERSION;
@@ -344,17 +353,27 @@ uint16 Ice_Transport::derive_virtual_port(uint64 id) const
 
 // ---- WebSocket signaling ----
 
+// NOTE on lock order: this callback runs on the network thread while the WS
+// client holds its own mutex (Run()/close_locked()), so the order here is
+// ws-mutex -> ice-mutex. Everywhere else the order is ice-mutex -> ws-mutex
+// (e.g. Ice_Transport::Send -> WS_Client::send). This inversion only works
+// because both mutexes are recursive and the callbacks fire on the same thread
+// that already holds the ice-mutex (Ice_Transport::Run()). Do not add any path
+// that invokes a WS callback from a thread not already holding the ice-mutex,
+// or decouple the callback via the ws_inbox first.
+
 void Ice_Transport::ws_state_handler(bool connected)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (connected) {
         ws_connected = true;
         list_requested = false;
+        reconnect_delay_ms = 1000; // backoff resets once signaling is up
         PRINT_DEBUG("ice signaling connected");
     } else {
         ws_connected = false;
         list_requested = false;
-        next_connect_attempt = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        next_connect_attempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(reconnect_delay_ms);
 
         // Candidates and descriptions sent while signaling is down cannot be
         // replayed by the WebSocket client. Recreate peers that never reached
@@ -381,6 +400,13 @@ void Ice_Transport::ws_message_handler(std::string &&payload)
 
 void Ice_Transport::process_ws_message_locked(const std::string &payload)
 {
+    // The signaling server relays messages from arbitrary peers, so field
+    // types are not trustworthy: "type": 123 (or any non-string where a
+    // string is expected) makes json.value()/get<>() throw a
+    // nlohmann::json::type_error. json::parse already runs with
+    // allow_exceptions=false; the try/catch covers the extractions below so a
+    // malformed message can never crash the network thread.
+    try {
     auto json = nlohmann::json::parse(payload, nullptr, false);
     if (json.is_discarded() || !json.is_object()) return;
 
@@ -450,6 +476,9 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
             ensure_agent_locked(peer_id, id_str);
             handle_candidate_locked(peer_id, candidate);
         }
+    }
+    } catch (const nlohmann::json::exception &) {
+        PRINT_DEBUG("ice signaling message dropped: malformed json");
     }
 }
 
@@ -805,6 +834,9 @@ void Ice_Transport::juice_state_changed(juice_agent_t *agent, juice_state_t stat
     // while holding its per-agent lock, and Run() calls into libjuice while
     // holding the transport mutex -> ABBA deadlock.
     std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
+    if (ctx->self->juice_events.size() >= MAX_JUICE_EVENTS) {
+        ctx->self->juice_events.pop_front(); // bound memory; keep the newest events
+    }
     ctx->self->juice_events.push_back(std::move(ev));
 }
 
@@ -812,18 +844,37 @@ void Ice_Transport::juice_candidate(juice_agent_t *agent, const char *sdp, void 
 {
     auto *ctx = static_cast<AgentContext *>(user_ptr);
     if (!ctx || !ctx->self || !sdp) return;
+    // Count by candidate type for the gathering summary (all on the agent
+    // thread; the counters are read in juice_gathering_done on the same thread).
+    if (strstr(sdp, "typ relay")) {
+        ++ctx->relay_candidates;
+    } else if (strstr(sdp, "typ srflx")) {
+        ++ctx->srflx_candidates;
+    } else if (strstr(sdp, "typ host")) {
+        ++ctx->host_candidates;
+    }
     JuiceEvent ev{};
     ev.kind = JuiceEvent::Kind::Candidate;
     ev.peer_id = ctx->peer_id;
     ev.agent = agent;
     ev.payload = sdp;
     std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
+    if (ctx->self->juice_events.size() >= MAX_JUICE_EVENTS) {
+        ctx->self->juice_events.pop_front();
+    }
     ctx->self->juice_events.push_back(std::move(ev));
 }
 
-void Ice_Transport::juice_gathering_done(juice_agent_t * /*agent*/, void * /*user_ptr*/)
+void Ice_Transport::juice_gathering_done(juice_agent_t *agent, void *user_ptr)
 {
-    // trickle ICE: candidates were already sent via juice_candidate
+    auto *ctx = static_cast<AgentContext *>(user_ptr);
+    if (!ctx || !ctx->self) return;
+    // Runs on the agent thread after all candidates were reported; the type
+    // counts make "TURN unreachable" (0 relay candidates) visible in the log.
+    PRINT_DEBUG("ice gathering done peer=%llu host=%d srflx=%d relay=%d",
+                static_cast<unsigned long long>(ctx->peer_id),
+                ctx->host_candidates, ctx->srflx_candidates, ctx->relay_candidates);
+    (void)agent;
 }
 
 void Ice_Transport::juice_recv(juice_agent_t *agent, const char *data, size_t size, void *user_ptr)
@@ -836,6 +887,9 @@ void Ice_Transport::juice_recv(juice_agent_t *agent, const char *data, size_t si
     ev.agent = agent;
     ev.payload.assign(data, data + size);
     std::lock_guard<std::mutex> lock(ctx->self->juice_events_mutex);
+    if (ctx->self->juice_events.size() >= MAX_JUICE_EVENTS) {
+        ctx->self->juice_events.pop_front();
+    }
     ctx->self->juice_events.push_back(std::move(ev));
 }
 
@@ -963,14 +1017,23 @@ bool Ice_Transport::send_fragments_locked(Peer &peer, uint64 dest_id, const std:
             PendingPacket pending{};
             pending.bytes = bytes;
             pending.next_send = now + std::chrono::milliseconds(ICE_RELIABLE_RETRY_MS);
+            pending.message_id = message_id;
             peer.pending[seq] = std::move(pending);
 
-            // Bound the backlog: evict the oldest fragment if a peer never ACKs
-            // (it is removed anyway once libjuice reports the session dead).
+            // Bound the backlog: if a peer never ACKs, evict the oldest whole
+            // message instead of individual fragments. Dropping one fragment of
+            // a message makes it undeliverable anyway, so keeping its siblings
+            // would only waste the retry budget. Fragments of a message are
+            // contiguous in the seq-ordered map, so the leading run with the
+            // oldest message_id is exactly that message.
             while (peer.pending.size() > MAX_PENDING_RELIABLE) {
                 auto oldest = peer.pending.begin();
                 if (oldest == peer.pending.end()) break;
-                peer.pending.erase(oldest);
+                uint32 evict_message = oldest->second.message_id;
+                auto it = peer.pending.begin();
+                while (it != peer.pending.end() && it->second.message_id == evict_message) {
+                    it = peer.pending.erase(it);
+                }
             }
         }
 
@@ -1143,7 +1206,6 @@ bool Ice_Transport::Send(Common_Message *msg, bool reliable)
 {
     if (!msg) return false;
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    if (!ws_connected) return false;
 
     uint64 dest_id = msg->dest_id();
     if (dest_id == 0) return false;
@@ -1160,7 +1222,6 @@ bool Ice_Transport::SendToEndpoint(Common_Message *msg, uint32 ip, uint16 port, 
 {
     if (!msg) return false;
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    if (!ws_connected) return false;
 
     Peer *peer = find_peer_by_endpoint_locked(ip, port);
     if (!peer && msg->dest_id() != 0) {
@@ -1178,7 +1239,6 @@ bool Ice_Transport::SendBroadcast(Common_Message *msg)
 {
     if (!msg) return false;
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    if (!ws_connected) return false;
 
     size_t size = msg->ByteSizeLong();
     std::vector<char> payload(size);
@@ -1250,7 +1310,8 @@ void Ice_Transport::Run()
 
         auto now = std::chrono::steady_clock::now();
         if (!ws_connected && !ws.is_connecting() && now >= next_connect_attempt) {
-            next_connect_attempt = now + std::chrono::seconds(2);
+            next_connect_attempt = now + std::chrono::milliseconds(reconnect_delay_ms);
+            reconnect_delay_ms = std::min(reconnect_delay_ms * 2, 30000);
             ws.connect();
         }
 
@@ -1289,6 +1350,22 @@ void Ice_Transport::Run()
         }
 
         send_pending_reliable_locked();
+
+        // Garbage-collect incomplete reassembly state. A partial message that
+        // has received no fragment for ICE_REASSEMBLY_GC_SEC cannot complete
+        // (the sender retries every 250ms, so silence means the fragments are
+        // lost); dropping it bounds peer.reassembly instead of leaking an entry
+        // per lost message.
+        for (auto &[peer_id, peer] : peers) {
+            (void)peer_id;
+            for (auto it = peer.reassembly.begin(); it != peer.reassembly.end();) {
+                if (now - it->second.updated > std::chrono::duration<double>(ICE_REASSEMBLY_GC_SEC)) {
+                    it = peer.reassembly.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
     }
 
     // juice_destroy joins the agent thread, which may still be executing a

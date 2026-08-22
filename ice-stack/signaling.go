@@ -126,6 +126,22 @@ type peerConn struct {
 	mu   sync.Mutex // serializes writes
 }
 
+// writeFrame serializes one frame on this connection. Every frame — payload
+// forwards from hub.send, pong replies, close replies — must go through this
+// method so concurrent writers cannot interleave bytes on the TCP stream
+// (which would corrupt the WebSocket framing and spuriously disconnect peers
+// mid-negotiation).
+func (c *peerConn) writeFrame(opcode byte, payload []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := writeFrame(c.conn, opcode, payload); err != nil {
+		c.conn.Close()
+		return err
+	}
+	return nil
+}
+
 type hub struct {
 	mu     sync.Mutex
 	peers  map[string]map[*peerConn]struct{}
@@ -226,12 +242,7 @@ func (h *hub) send(id string, payload []byte) {
 	h.mu.Unlock()
 
 	for _, c := range conns {
-		c.mu.Lock()
-		_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if err := writeFrame(c.conn, opText, payload); err != nil {
-			c.conn.Close()
-		}
-		c.mu.Unlock()
+		_ = c.writeFrame(opText, payload)
 	}
 }
 
@@ -296,6 +307,12 @@ func (h *hub) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// Slowloris guard: bound the upgrade exchange (and the window between the
+	// 101 response and the client's first frame). Cleared once the handshake
+	// is written; normal operation keeps reads deadline-free so idle-but-alive
+	// peers are not disconnected.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
 	// The read loop below blocks until the connection dies, so without keepalive
 	// a NAT/proxy that silently drops an idle websocket would leave a zombie
 	// peer entry until the next write fails. Keepalive probes keep the mapping
@@ -313,6 +330,7 @@ func (h *hub) serve(w http.ResponseWriter, r *http.Request) {
 	if _, err := conn.Write([]byte(upgrade)); err != nil {
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{}) // handshake done
 
 	id := strings.Trim(r.URL.Path, "/")
 	if id == "" {
@@ -345,11 +363,9 @@ func (h *hub) serve(w http.ResponseWriter, r *http.Request) {
 				h.forward(id, msg)
 			}
 		case opPing:
-			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			writeFrame(conn, opPong, payload)
+			pc.writeFrame(opPong, payload)
 		case opClose:
-			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			writeFrame(conn, opClose, payload)
+			pc.writeFrame(opClose, payload)
 			return
 		}
 	}
@@ -362,6 +378,11 @@ func main() {
 
 	h := newHub(*secret)
 	http.HandleFunc("/", h.serve)
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           nil,
+		ReadHeaderTimeout: 10 * time.Second, // slowloris guard: bound the pre-upgrade read
+	}
 	log.Printf("signaling listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	log.Fatal(srv.ListenAndServe())
 }

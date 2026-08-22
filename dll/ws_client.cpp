@@ -5,6 +5,8 @@
 
 #if defined(STEAM_WIN32)
 #include <bcrypt.h>
+#else
+#include <poll.h>
 #endif
 
 // Note: global winsock calls are always written ::connect() / ::send() below
@@ -14,6 +16,19 @@ namespace {
 
 constexpr char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 constexpr uint64_t WS_MAX_FRAME_SIZE = 1ull << 20; // 1 MiB, mirroring the signaling server cap
+// Liveness: the client pings every WS_PING_INTERVAL while Open and treats the
+// connection as dead if no frame at all arrives within WS_LIVENESS_TIMEOUT
+// (covers NAT idle drops / upstream power loss, which never surface as TCP
+// errors). The server replies to every ping with a pong, so a healthy link
+// always refreshes last_activity well inside the window.
+constexpr auto WS_PING_INTERVAL = std::chrono::seconds(15);
+constexpr auto WS_LIVENESS_TIMEOUT = std::chrono::seconds(40);
+// Connect/handshake deadline: a server that accepts TCP but never completes
+// the upgrade (or a blackholed network) must not leave is_connecting() true
+// forever, which would wedge the transport's reconnect loop.
+constexpr auto WS_CONNECT_TIMEOUT = std::chrono::seconds(8);
+// Upper bound for one reassembled (fragmented) incoming message.
+constexpr size_t WS_MAX_MESSAGE_ACCUM = 4ull << 20; // 4 MiB
 
 // ---- socket helpers ----
 
@@ -265,6 +280,10 @@ WS_Client::~WS_Client()
 void WS_Client::configure(const std::string &host_, uint16_t port_, const std::string &path_, const std::string &secret_)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (host_ != host || port_ != port) {
+        resolved_host.clear(); // a different endpoint must be re-resolved
+        resolved_ip = 0;
+    }
     host = host_;
     port = port_;
     path = path_;
@@ -343,20 +362,28 @@ void WS_Client::connect()
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    struct addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo *result = nullptr;
-    if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || result == nullptr) {
-        PRINT_DEBUG("ws resolve failed host='%s'", host.c_str());
-        if (result) freeaddrinfo(result);
-        close_socket();
-        return;
+    if (host != resolved_host || resolved_ip == 0) {
+        // Blocking DNS lookup, cached per host: only the first connect for a
+        // given endpoint pays the (potentially multi-second) resolution cost
+        // instead of every 2s retry while signaling is down.
+        struct addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *result = nullptr;
+        if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || result == nullptr) {
+            PRINT_DEBUG("ws resolve failed host='%s'", host.c_str());
+            if (result) freeaddrinfo(result);
+            close_socket();
+            return;
+        }
+        auto *ipv4 = reinterpret_cast<sockaddr_in *>(result->ai_addr);
+        resolved_ip = ipv4->sin_addr.s_addr; // network byte order
+        resolved_host = host;
+        freeaddrinfo(result);
     }
-    auto *ipv4 = reinterpret_cast<sockaddr_in *>(result->ai_addr);
-    addr.sin_addr = ipv4->sin_addr;
-    freeaddrinfo(result);
+    addr.sin_addr.s_addr = resolved_ip;
 
+    connect_started = std::chrono::steady_clock::now();
     int res = ::connect(sock, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
     if (res != 0 && !ws_last_error_is_would_block()) {
         PRINT_DEBUG("ws connect failed immediately err=%d", ws_last_error());
@@ -393,6 +420,7 @@ void WS_Client::finish_connect_locked()
         return;
     }
 
+#if defined(STEAM_WIN32)
     fd_set writefds;
     FD_ZERO(&writefds);
     FD_SET(sock, &writefds);
@@ -400,6 +428,15 @@ void WS_Client::finish_connect_locked()
     timeout.tv_sec = 0;
     timeout.tv_usec = 0;
     int res = select(static_cast<int>(sock + 1), nullptr, &writefds, nullptr, &timeout);
+#else
+    // poll() instead of select(): select() with a descriptor >= FD_SETSIZE is
+    // undefined behavior on Linux, and a long-lived process can easily pass
+    // that threshold.
+    struct pollfd pfd{};
+    pfd.fd = sock;
+    pfd.events = POLLOUT;
+    int res = poll(&pfd, 1, 0);
+#endif
     if (res == 0) return; // still connecting
     if (res < 0) {
         PRINT_DEBUG("ws connect select failed err=%d", ws_last_error());
@@ -533,6 +570,8 @@ void WS_Client::process_handshake_locked()
 
     state = State::Open;
     PRINT_DEBUG("ws connected");
+    last_activity = std::chrono::steady_clock::now();
+    next_ping = last_activity + WS_PING_INTERVAL;
     if (state_cb) state_cb(true);
 
     // any bytes after the header are the first frames
@@ -644,6 +683,10 @@ void WS_Client::pump_read_locked()
 
 void WS_Client::handle_frame_locked(uint8_t opcode, const std::vector<char> &payload)
 {
+    // Any complete frame is proof the link is alive (the server's pongs keep
+    // the liveness check satisfied between real messages).
+    last_activity = std::chrono::steady_clock::now();
+
     switch (opcode) {
     case 0x1: // text
     case 0x2: // binary
@@ -656,6 +699,11 @@ void WS_Client::handle_frame_locked(uint8_t opcode, const std::vector<char> &pay
             std::string msg(payload.begin(), payload.end());
             if (message_cb) message_cb(std::move(msg));
         } else {
+            if (payload.size() > WS_MAX_MESSAGE_ACCUM) {
+                PRINT_DEBUG("ws fragmented message too large");
+                close_locked();
+                return;
+            }
             message_accum.assign(payload.begin(), payload.end());
         }
         break;
@@ -665,11 +713,20 @@ void WS_Client::handle_frame_locked(uint8_t opcode, const std::vector<char> &pay
             close_locked();
             return;
         }
+        if (message_accum.size() + payload.size() > WS_MAX_MESSAGE_ACCUM) {
+            PRINT_DEBUG("ws fragmented message too large");
+            close_locked();
+            return;
+        }
         message_accum.append(payload.begin(), payload.end());
         if (frame_fin) deliver_message_locked();
         break;
     case 0x8: // close
         queue_frame_locked(0x8, payload);
+        // Best-effort flush of the close reply: the peer is allowed to stop
+        // reading right after a close, but if the socket still accepts bytes
+        // the reply should actually leave instead of being discarded.
+        pump_write_locked();
         PRINT_DEBUG("ws close received");
         close_locked();
         break;
@@ -702,6 +759,20 @@ void WS_Client::Run()
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (!socket_valid()) return;
 
+    auto now = std::chrono::steady_clock::now();
+
+    // Connect/handshake deadline: if the TCP connect or the HTTP upgrade does
+    // not complete in time, drop the socket so is_connecting() clears and the
+    // transport's reconnect loop can retry (a TCP-connected-but-silent server
+    // would otherwise wedge it forever).
+    if (state == State::Connecting || state == State::Handshaking) {
+        if (now - connect_started > WS_CONNECT_TIMEOUT) {
+            PRINT_DEBUG("ws connect/handshake timed out");
+            close_locked();
+            return;
+        }
+    }
+
     if (state == State::Connecting) {
         finish_connect_locked();
         if (state != State::Handshaking) return;
@@ -719,6 +790,20 @@ void WS_Client::Run()
         if (state != State::Open) return;
     }
     if (state != State::Open) return;
+
+    // Liveness: keep the connection observable. A silently dropped TCP stream
+    // (NAT idle timeout, upstream power loss) never produces a recv error, so
+    // without this the transport would believe signaling is up forever.
+    if (now >= next_ping) {
+        std::vector<char> empty{};
+        queue_frame_locked(0x9, empty); // ping
+        next_ping = now + WS_PING_INTERVAL;
+    }
+    if (now - last_activity > WS_LIVENESS_TIMEOUT) {
+        PRINT_DEBUG("ws liveness timeout: no frame received");
+        close_locked();
+        return;
+    }
 
     pump_write_locked();
     if (!socket_valid()) return;

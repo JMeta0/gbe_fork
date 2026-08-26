@@ -205,6 +205,32 @@ Ice_Transport::PeerConnectionType selected_candidate_connection_type(juice_agent
     return Ice_Transport::PeerConnectionType::Direct;
 }
 
+// Lock-free raw send used by the juice_recv fast path (agent thread). Builds
+// an ICE frame and hands it straight to libjuice without touching any Peer
+// state or the transport mutex. Safe to call from a libjuice callback: the
+// conn mutex is recursive ("Recursive to allow calls from user callbacks",
+// conn_thread.c) and libjuice itself sends STUN replies from that context.
+// Header fields not passed in (ack/ack_bits/message_id/fragment_*) are 0, the
+// same as the PING/PONG frames already on the wire.
+bool send_raw_ice_packet(juice_agent_t *agent, uint8 type, uint32 flags, uint64 source_id, uint64 dest_id,
+                         uint32 packet_seq, uint32 message_id, uint16 fragment_index,
+                         uint16 fragment_count, const std::vector<char> &payload, uint64 token)
+{
+    if (!agent) return false;
+    IceHeader header{};
+    header.type = type;
+    header.flags = flags;
+    header.packet_seq = packet_seq;
+    header.source_id = source_id;
+    header.dest_id = dest_id;
+    header.token = token;
+    header.message_id = message_id;
+    header.fragment_index = fragment_index;
+    header.fragment_count = fragment_count;
+    std::vector<char> bytes = serialize_ice_header(header, payload);
+    return juice_send(agent, bytes.data(), bytes.size()) == JUICE_ERR_SUCCESS;
+}
+
 } // namespace
 
 Ice_Transport::Ice_Transport(
@@ -761,6 +787,7 @@ juice_agent_t *Ice_Transport::create_agent_locked(uint64 peer_id)
     auto *ctx = new AgentContext{};
     ctx->self = this;
     ctx->peer_id = peer_id;
+    ctx->primary_id = primary_id();
     config.user_ptr = ctx;
 
     juice_agent_t *agent = juice_create(&config);
@@ -907,6 +934,35 @@ void Ice_Transport::juice_recv(juice_agent_t *agent, const char *data, size_t si
 {
     auto *ctx = static_cast<AgentContext *>(user_ptr);
     if (!ctx || !ctx->self || !data || size == 0) return;
+
+    // Fast path: PING/PONG are answered and stamped right here on the agent
+    // thread, the moment the datagram arrives. Routing them through the
+    // frame-tick slow path (queue -> next Run() -> reply -> queue -> next
+    // Run() -> stamp) would add up to two frame periods (~33ms at 60fps) to
+    // the measured RTT, which is why a direct loopback link showed 11-33ms.
+    // The reply touches no Peer state and no transport mutex, so it cannot
+    // deadlock against Run() (see send_raw_ice_packet).
+    {
+        std::vector<char> packet(data, data + size);
+        IceHeader header{};
+        std::vector<char> payload{};
+        if (deserialize_ice_header(packet, header, payload)) {
+            if (header.type == ICE_PKT_PING) {
+                // Echo the id the sender addressed us with (what the peer
+                // believes our id is); falls back to the snapshot taken at
+                // agent creation. No local_ids read on this thread.
+                uint64 our_id = header.dest_id != 0 ? header.dest_id : ctx->primary_id;
+                std::vector<char> empty{};
+                send_raw_ice_packet(agent, ICE_PKT_PONG, 0, our_id, header.source_id, 0, 0, 0, 0, empty, header.token);
+                return;
+            }
+            if (header.type == ICE_PKT_PONG) {
+                ctx->self->handle_pong_fast(ctx, header.token);
+                return;
+            }
+        }
+    }
+
     JuiceEvent ev{};
     ev.kind = JuiceEvent::Kind::Recv;
     ev.peer_id = ctx->peer_id;
@@ -917,6 +973,22 @@ void Ice_Transport::juice_recv(juice_agent_t *agent, const char *data, size_t si
         ctx->self->juice_events.pop_front();
     }
     ctx->self->juice_events.push_back(std::move(ev));
+}
+
+void Ice_Transport::handle_pong_fast(AgentContext *ctx, uint64 token)
+{
+    if (!ctx || token == 0) return;
+    // Ignore stale PONGs (token mismatch): the token is a steady-clock
+    // timestamp in microseconds, unique within the 2s ping window.
+    if (ctx->ping_token.load() != token) return;
+    int64_t sent_us = ctx->ping_sent_at_us.load();
+    if (sent_us == 0) return;
+    int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int rtt = static_cast<int>((now_us - sent_us) / 1000);
+    ctx->rtt_ms.store(std::max(rtt, 0));
+    ctx->ping_token.store(0);
+    ctx->ping_sent_at_us.store(0);
 }
 
 void Ice_Transport::process_juice_events_locked()
@@ -1145,25 +1217,6 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
         }
     }
 
-    if (header.type == ICE_PKT_PING) {
-        // Reply with a PONG echoing the token so the sender can match the
-        // round-trip. Sends directly over the active path (no reliability
-        // layer) so the measured latency reflects the real data channel.
-        std::vector<char> empty{};
-        send_ice_packet_locked(peer, ICE_PKT_PONG, 0, primary_id(), header.source_id, 0, 0, 0, 0, empty, header.token);
-        return;
-    }
-    if (header.type == ICE_PKT_PONG) {
-        if (header.token != 0 && header.token == peer.ping_token &&
-            peer.ping_sent_at != std::chrono::steady_clock::time_point{}) {
-            int rtt = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - peer.ping_sent_at).count());
-            peer.rtt_ms = std::max(rtt, 0);
-            peer.ping_token = 0;
-            peer.ping_sent_at = {};
-        }
-        return;
-    }
     if (header.type == ICE_PKT_ACK) return;
     if (header.type != ICE_PKT_DATA || duplicate) return;
 
@@ -1236,12 +1289,15 @@ void Ice_Transport::update_peer_stats_locked(std::chrono::steady_clock::time_poi
         // Refresh the connection type from the ICE selected candidate pair.
         peer.connection_type = selected_candidate_connection_type(peer.agent);
 
-        // Send a PING with a unique token; the matching PONG computes the RTT.
-        // The token is a steady-clock timestamp in microseconds: unique within
-        // the 2s window, so a stale PONG (token mismatch) is ignored.
+        auto cit = agent_ctx.find(peer.agent);
+        if (cit == agent_ctx.end() || !cit->second) continue;
+
+        // Arm the fast-path ping: the agent thread answers the PONG the moment
+        // it arrives and stamps the RTT (see juice_recv/handle_pong_fast), so
+        // the measurement no longer waits for the next frame tick.
         uint64 token = static_cast<uint64>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
-        peer.ping_token = token;
-        peer.ping_sent_at = now;
+        cit->second->ping_token.store(token);
+        cit->second->ping_sent_at_us.store(static_cast<int64_t>(token));
         std::vector<char> empty{};
         send_ice_packet_locked(peer, ICE_PKT_PING, 0, primary_id(), peer.primary_id, 0, 0, 0, 0, empty, token);
     }
@@ -1254,7 +1310,13 @@ bool Ice_Transport::GetPeerStats(uint64 primary_id, PeerStats &out)
     if (!peer) return false;
     out.connected = peer->connected;
     out.connection_type = peer->connection_type;
-    out.rtt_ms = peer->rtt_ms;
+    out.rtt_ms = -1;
+    if (peer->agent) {
+        auto cit = agent_ctx.find(peer->agent);
+        if (cit != agent_ctx.end() && cit->second) {
+            out.rtt_ms = cit->second->rtt_ms.load();
+        }
+    }
     return true;
 }
 

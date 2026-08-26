@@ -30,10 +30,10 @@ constexpr size_t MAX_PENDING_RELIABLE = 256;
 constexpr int ICE_PING_INTERVAL_MS = 2000;
 // Cadence of the dedicated pump thread. The ICE protocol (juice event
 // draining, signaling, retries, pings) runs here instead of inside the game's
-// per-frame SteamAPI_RunCallbacks, so it keeps flowing at a fixed ~5ms even
+// per-frame SteamAPI_RunCallbacks, so it keeps flowing at a fixed ~10ms even
 // when the render loop stalls. Requires the 1ms Windows timer resolution
 // (timeBeginPeriod), requested once by pump_proc().
-constexpr int ICE_PUMP_INTERVAL_MS = 5;
+constexpr int ICE_PUMP_INTERVAL_MS = 10;
 // How long to keep an established ICE session after signaling reports the peer
 // disconnected before presuming it gone. Peers broadcast announces every ~5s,
 // so any live peer clears the grace flag well within this window; a process
@@ -271,7 +271,7 @@ Ice_Transport::Ice_Transport(
     ws.configure(signaling_host, signaling_port, peer_id_string(primary_id()), signaling_secret);
 
     // Start the dedicated protocol pump so the ICE layer ticks at a fixed
-    // ~5ms regardless of how often the game calls SteamAPI_RunCallbacks.
+    // ~10ms regardless of how often the game calls SteamAPI_RunCallbacks.
     pump_thread = std::thread(&Ice_Transport::pump_proc, this);
 
     PRINT_DEBUG("ice transport created host='%s' port=%u appid=%u ids=%llu stun='%s:%u' turn='%s:%u' user='%s'", signaling_host.c_str(), signaling_port, appid, static_cast<unsigned long long>(primary_id()), stun_host.c_str(), stun_port, turn_host.c_str(), turn_port, turn_user.c_str());
@@ -1554,7 +1554,7 @@ void Ice_Transport::pump_proc()
 {
 #if defined(STEAM_WIN32)
     // The default Windows timer resolution is ~15.6ms, which would silently
-    // defeat the ~5ms pump cadence. Request the 1ms resolution for the
+    // defeat the ~10ms pump cadence. Request the 1ms resolution for the
     // lifetime of this thread and release it on exit.
     timeBeginPeriod(1);
 #endif

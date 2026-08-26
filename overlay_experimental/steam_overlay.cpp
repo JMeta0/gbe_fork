@@ -2120,6 +2120,23 @@ void Steam_Overlay::render_main_window()
         ImGui::LabelText("##label", "%s", translationFriends[current_language]);
 
         if (!friends.empty()) {
+            // Refresh per-friend ping + connection type (Direct/STUN/TURN) at
+            // most once per second so the friend list shows live values without
+            // polling the network layer every frame.
+            auto now = std::chrono::steady_clock::now();
+            if (connections_cache_updated == std::chrono::steady_clock::time_point{} ||
+                now - connections_cache_updated >= std::chrono::seconds(1)) {
+                connections_cache.clear();
+                for (const auto &[frd, state] : friends) {
+                    (void)state;
+                    FriendConnectionStats stats{};
+                    if (network->GetFriendStats(CSteamID(static_cast<uint64>(frd.id())), stats)) {
+                        connections_cache[static_cast<uint64>(frd.id())] = stats;
+                    }
+                }
+                connections_cache_updated = now;
+            }
+
             if (i_have_lobby) {
                 std::string inviteAll(translationInviteAll[current_language]);
                 inviteAll.append("##PopupInviteAllFriends");
@@ -2132,7 +2149,26 @@ void Steam_Overlay::render_main_window()
                 std::for_each(friends.begin(), friends.end(), [this](std::pair<Friend const, friend_window_state> &i) {
                     ImGui::PushID(i.second.id-base_friend_window_id+base_friend_item_id);
 
-                    ImGui::Selectable(i.second.window_title.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick);
+                    // Append ping + connection type to the right of the
+                    // "name playing appid" line for friends connected over ICE.
+                    std::string label = i.second.window_title;
+                    auto cit = connections_cache.find(static_cast<uint64>(i.first.id()));
+                    if (cit != connections_cache.end() && cit->second.connected) {
+                        label += "   ";
+                        if (cit->second.rtt_ms >= 0) {
+                            label += std::to_string(cit->second.rtt_ms);
+                            label += " ms";
+                        } else {
+                            label += "- ms";
+                        }
+                        switch (cit->second.connection_type) {
+                        case 1: label += " "; label += translationConnDirect[current_language]; break;
+                        case 2: label += " "; label += translationConnStun[current_language]; break;
+                        case 3: label += " "; label += translationConnTurn[current_language]; break;
+                        default: break;
+                        }
+                    }
+                    ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick);
                     build_friend_context_menu(i.first, i.second);
                     if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(0)) {
                         i.second.window_state |= window_state_show;

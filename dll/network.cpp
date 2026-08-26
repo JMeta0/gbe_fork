@@ -1498,6 +1498,21 @@ uint16 Networking::getPort(CSteamID id)
     return 0;
 }
 
+bool Networking::GetFriendStats(CSteamID id, FriendConnectionStats &out)
+{
+    if (!id.IsValid()) return false;
+    // Leaf lock (never `mutex`): the network thread may be inside Run() holding
+    // `mutex` while the overlay polls stats from the render thread.
+    std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+    if (!ice_transport) return false;
+    Ice_Transport::PeerStats stats{};
+    if (!ice_transport->GetPeerStats(id.ConvertToUint64(), stats)) return false;
+    out.connected = stats.connected;
+    out.connection_type = static_cast<int>(stats.connection_type);
+    out.rtt_ms = stats.rtt_ms;
+    return true;
+}
+
 bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
 {
     if (!enabled) return false;

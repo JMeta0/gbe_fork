@@ -96,6 +96,16 @@ struct Connection {
     std::chrono::high_resolution_clock::time_point last_received{};
 };
 
+// Connection telemetry for a friend over the ICE transport, for the overlay.
+// `connection_type` mirrors Ice_Transport::PeerConnectionType:
+// 0 = Unknown, 1 = Direct (host-host), 2 = Stun (srflx, P2P via STUN),
+// 3 = Turn (relayed through the TURN server).
+struct FriendConnectionStats {
+    bool connected = false;
+    int connection_type = 0;
+    int rtt_ms = -1; // last measured round-trip in ms, -1 = no sample yet
+};
+
 class Settings;
 class Ice_Transport;
 
@@ -184,6 +194,11 @@ public:
     uint32 getIP(CSteamID id);
     uint16 getPort(CSteamID id);
     uint32 getOwnIP();
+
+    // Fills `out` with the ICE connection telemetry (RTT + selected candidate
+    // type) for the given friend. Returns false when ICE is disabled or no
+    // session exists for this id yet; `out` is left untouched then.
+    bool GetFriendStats(CSteamID id, FriendConnectionStats &out);
 
     void startQuery(IP_PORT ip_port);
     void shutDownQuery();

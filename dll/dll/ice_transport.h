@@ -63,6 +63,16 @@ public:
         std::chrono::steady_clock::time_point updated{};
     };
 
+    // How two peers are actually connected, derived from the ICE selected
+    // candidate pair: relayed through a TURN server, P2P through NAT (reflexive
+    // address discovered via STUN), or a direct host-to-host path.
+    enum class PeerConnectionType {
+        Unknown = 0,
+        Direct, // host-host, no server involved
+        Stun,   // server-reflexive (srflx), P2P via STUN-discovered address
+        Turn,   // relayed through the TURN server
+    };
+
     struct Peer {
         uint64 primary_id = 0;
         std::vector<uint64> ids{};          // steamids this peer announced
@@ -90,6 +100,22 @@ public:
         // re-registration. After ICE_DISCONNECT_GRACE_SEC without either, the
         // peer is presumed gone and removed (fast friend-list cleanup).
         std::chrono::steady_clock::time_point signal_disconnected_at{};
+
+        // ---- telemetry (updated by Run() on the network thread) ----
+        // Ping (RTT) over the active ICE path via ICE_PKT_PING/PONG frames,
+        // plus the selected candidate pair type, exposed to the overlay.
+        std::chrono::steady_clock::time_point next_ping_at{}; // cadence for ping/type refresh
+        std::chrono::steady_clock::time_point ping_sent_at{};
+        uint64 ping_token = 0;
+        int rtt_ms = -1; // last measured round-trip in ms, -1 = no sample yet
+        PeerConnectionType connection_type = PeerConnectionType::Unknown;
+    };
+
+    // Snapshot of a peer's connection telemetry, read by the overlay.
+    struct PeerStats {
+        bool connected = false;
+        PeerConnectionType connection_type = PeerConnectionType::Unknown;
+        int rtt_ms = -1; // -1 = no sample yet
     };
 
     Ice_Transport(
@@ -111,6 +137,10 @@ public:
     bool PollDisconnect(std::vector<CSteamID> &ids, uint32 &virtual_ip, uint16 &virtual_port, bool &session_reset);
     bool poll_new_connection();
     void request_list();
+    // Fills `out` with the peer's current connection telemetry (RTT + selected
+    // candidate type). Returns false when the peer is unknown (e.g. ICE
+    // disabled or no session for this id yet).
+    bool GetPeerStats(uint64 primary_id, PeerStats &out);
     uint32 virtual_ip();
     uint16 virtual_port();
 
@@ -183,10 +213,14 @@ private:
     // ---- reliability / fragmentation layer ----
     bool send_ice_packet_locked(Peer &peer, uint8 type, uint32 flags, uint64 source_id, uint64 dest_id,
                                 uint32 packet_seq, uint32 message_id, uint16 fragment_index,
-                                uint16 fragment_count, const std::vector<char> &payload);
+                                uint16 fragment_count, const std::vector<char> &payload,
+                                uint64 token = 0);
     bool send_fragments_locked(Peer &peer, uint64 dest_id, const std::vector<char> &payload, bool reliable);
     void send_pending_reliable_locked();
     void handle_ice_packet_locked(Peer &peer, const std::vector<char> &packet);
+    // Periodically pings connected peers (RTT) and refreshes the selected
+    // candidate pair type. Runs on the network thread inside Run().
+    void update_peer_stats_locked(std::chrono::steady_clock::time_point now);
 
     // ---- virtual endpoint derivation ----
     uint32 derive_virtual_ip(uint64 id) const;

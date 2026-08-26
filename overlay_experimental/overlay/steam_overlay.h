@@ -171,6 +171,12 @@ class Steam_Overlay
     // to this specific lobby, not the last joined one
     std::atomic<uint64> invite_lobby_id{};
 
+    // Per-friend connection telemetry cache (ping + Direct/STUN/TURN) shown
+    // inline in the friend list. Refreshed from Networking at most once per
+    // second while the overlay is open.
+    std::map<uint64, FriendConnectionStats> connections_cache{};
+    std::chrono::steady_clock::time_point connections_cache_updated{};
+
     // Rate-limiting queue for achievement notifications
     struct ScheduledAchievement {
         Overlay_Achievement ach;

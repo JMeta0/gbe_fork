@@ -18,10 +18,16 @@ constexpr uint32 ICE_MAGIC = 0x4E505447; // GPTN
 constexpr uint8 ICE_VERSION = 1;
 constexpr uint8 ICE_PKT_DATA = 3;
 constexpr uint8 ICE_PKT_ACK = 4;
+constexpr uint8 ICE_PKT_PING = 5;
+constexpr uint8 ICE_PKT_PONG = 6;
 constexpr uint32 ICE_FLAG_RELIABLE = 1u << 0;
 constexpr size_t ICE_FRAGMENT_MTU = 1100;
 constexpr int ICE_RELIABLE_RETRY_MS = 250;
 constexpr size_t MAX_PENDING_RELIABLE = 256;
+// How often a connected peer is pinged (RTT) and its selected candidate pair
+// type re-checked. Small frames over the active ICE path; 2s keeps the overlay
+// stats fresh without measurable overhead.
+constexpr int ICE_PING_INTERVAL_MS = 2000;
 // How long to keep an established ICE session after signaling reports the peer
 // disconnected before presuming it gone. Peers broadcast announces every ~5s,
 // so any live peer clears the grace flag well within this window; a process
@@ -177,6 +183,26 @@ uint32 fnv1a32(uint32 appid, uint64 id)
         mix(static_cast<uint32>((id >> (i * 8)) & 0xFF));
     }
     return hash;
+}
+
+// Classifies the live connection from the ICE selected candidate pair:
+// relayed via TURN if either side uses a relay candidate; otherwise the
+// path is P2P — srflx (reflexive address learned via STUN) or host (direct).
+Ice_Transport::PeerConnectionType selected_candidate_connection_type(juice_agent_t *agent)
+{
+    if (!agent) return Ice_Transport::PeerConnectionType::Unknown;
+    char local[512]{};
+    char remote[512]{};
+    if (juice_get_selected_candidates(agent, local, sizeof(local), remote, sizeof(remote)) != JUICE_ERR_SUCCESS) {
+        return Ice_Transport::PeerConnectionType::Unknown;
+    }
+    if (strstr(local, "typ relay") || strstr(remote, "typ relay")) {
+        return Ice_Transport::PeerConnectionType::Turn;
+    }
+    if (strstr(local, "typ srflx") || strstr(remote, "typ srflx")) {
+        return Ice_Transport::PeerConnectionType::Stun;
+    }
+    return Ice_Transport::PeerConnectionType::Direct;
 }
 
 } // namespace
@@ -957,7 +983,8 @@ void Ice_Transport::process_juice_events_locked()
 
 bool Ice_Transport::send_ice_packet_locked(Peer &peer, uint8 type, uint32 flags, uint64 source_id, uint64 dest_id,
                                            uint32 packet_seq, uint32 message_id, uint16 fragment_index,
-                                           uint16 fragment_count, const std::vector<char> &payload)
+                                           uint16 fragment_count, const std::vector<char> &payload,
+                                           uint64 token)
 {
     if (!peer.agent || !peer.connected) return false;
 
@@ -967,6 +994,7 @@ bool Ice_Transport::send_ice_packet_locked(Peer &peer, uint8 type, uint32 flags,
     header.packet_seq = packet_seq;
     header.source_id = source_id;
     header.dest_id = dest_id;
+    header.token = token;
     header.message_id = message_id;
     header.fragment_index = fragment_index;
     header.fragment_count = fragment_count;
@@ -1117,6 +1145,25 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
         }
     }
 
+    if (header.type == ICE_PKT_PING) {
+        // Reply with a PONG echoing the token so the sender can match the
+        // round-trip. Sends directly over the active path (no reliability
+        // layer) so the measured latency reflects the real data channel.
+        std::vector<char> empty{};
+        send_ice_packet_locked(peer, ICE_PKT_PONG, 0, primary_id(), header.source_id, 0, 0, 0, 0, empty, header.token);
+        return;
+    }
+    if (header.type == ICE_PKT_PONG) {
+        if (header.token != 0 && header.token == peer.ping_token &&
+            peer.ping_sent_at != std::chrono::steady_clock::time_point{}) {
+            int rtt = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - peer.ping_sent_at).count());
+            peer.rtt_ms = std::max(rtt, 0);
+            peer.ping_token = 0;
+            peer.ping_sent_at = {};
+        }
+        return;
+    }
     if (header.type == ICE_PKT_ACK) return;
     if (header.type != ICE_PKT_DATA || duplicate) return;
 
@@ -1176,6 +1223,39 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
     inbound.ip_port.ip = htonl(peer.virtual_ip);
     inbound.ip_port.port = htons(peer.virtual_port);
     inbound_packets.push_back(std::move(inbound));
+}
+
+void Ice_Transport::update_peer_stats_locked(std::chrono::steady_clock::time_point now)
+{
+    for (auto &[peer_id, peer] : peers) {
+        (void)peer_id;
+        if (!peer.agent || !peer.connected) continue;
+        if (now < peer.next_ping_at) continue;
+        peer.next_ping_at = now + std::chrono::milliseconds(ICE_PING_INTERVAL_MS);
+
+        // Refresh the connection type from the ICE selected candidate pair.
+        peer.connection_type = selected_candidate_connection_type(peer.agent);
+
+        // Send a PING with a unique token; the matching PONG computes the RTT.
+        // The token is a steady-clock timestamp in microseconds: unique within
+        // the 2s window, so a stale PONG (token mismatch) is ignored.
+        uint64 token = static_cast<uint64>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
+        peer.ping_token = token;
+        peer.ping_sent_at = now;
+        std::vector<char> empty{};
+        send_ice_packet_locked(peer, ICE_PKT_PING, 0, primary_id(), peer.primary_id, 0, 0, 0, 0, empty, token);
+    }
+}
+
+bool Ice_Transport::GetPeerStats(uint64 primary_id, PeerStats &out)
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    Peer *peer = find_peer_locked(primary_id);
+    if (!peer) return false;
+    out.connected = peer->connected;
+    out.connection_type = peer->connection_type;
+    out.rtt_ms = peer->rtt_ms;
+    return true;
 }
 
 // ---- public send / receive API ----
@@ -1350,6 +1430,10 @@ void Ice_Transport::Run()
         }
 
         send_pending_reliable_locked();
+
+        // Ping connected peers and refresh their selected candidate type so the
+        // overlay has fresh RTT + Direct/STUN/TURN data.
+        update_peer_stats_locked(now);
 
         // Garbage-collect incomplete reassembly state. A partial message that
         // has received no fragment for ICE_REASSEMBLY_GC_SEC cannot complete

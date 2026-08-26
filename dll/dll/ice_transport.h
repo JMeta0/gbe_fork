@@ -13,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 // Internet transport for the emulator, built on a full ICE + STUN + TURN stack:
@@ -103,7 +104,7 @@ public:
         std::chrono::steady_clock::time_point signal_disconnected_at{};
 
         // Cadence for the 2s ping / connection-type refresh. Only touched by
-        // update_peer_stats_locked() on the network thread.
+        // update_peer_stats_locked() on the pump thread.
         std::chrono::steady_clock::time_point next_ping_at{};
         PeerConnectionType connection_type = PeerConnectionType::Unknown;
     };
@@ -124,6 +125,10 @@ public:
 
     bool enabled() const;
     bool ready();
+    // Advances the whole ICE protocol: drains libjuice callback events,
+    // drives the signaling websocket, retries reliable fragments, arms pings
+    // and garbage-collects stale state. Runs on the dedicated pump thread at
+    // ICE_PUMP_INTERVAL_MS, independent of the game's render loop.
     void Run();
     void set_appid(uint32 appid);
     void add_listen_id(CSteamID id);
@@ -162,7 +167,7 @@ private:
         // thread without reading local_ids.
         uint64 primary_id = 0;
         // ---- fast-path ping state (RTT over the active ICE path) ----
-        // Armed by update_peer_stats_locked() on the network thread, answered
+        // Armed by update_peer_stats_locked() on the pump thread, answered
         // and stamped by juice_recv()/handle_pong_fast() on the agent thread
         // the moment the PONG arrives. Atomic so neither side needs the
         // transport mutex. ping_sent_at_us is the steady-clock timestamp in
@@ -172,7 +177,7 @@ private:
         std::atomic<int> rtt_ms{-1}; // last measured round-trip in ms, -1 = no sample yet
     };
 
-    // Events queued by libjuice callbacks and processed on the network thread
+    // Events queued by libjuice callbacks and processed on the pump thread
     // inside Run() under the transport mutex.
     struct JuiceEvent {
         enum class Kind {
@@ -201,7 +206,7 @@ private:
     // touching the transport mutex.
     void handle_pong_fast(AgentContext *ctx, uint64 token);
 
-    // ---- WebSocket callbacks (run on the network thread inside Run()) ----
+    // ---- WebSocket callbacks (run on the pump thread inside Run()) ----
     void ws_message_handler(std::string &&payload);
     void ws_state_handler(bool connected);
 
@@ -218,6 +223,11 @@ private:
     std::string peer_id_string(uint64 id) const;
     uint64 parse_peer_id(const std::string &value) const;
 
+    // Dedicated pump thread: loops Run() + sleep at ICE_PUMP_INTERVAL_MS so
+    // the ICE protocol never depends on the game calling SteamAPI_RunCallbacks
+    // (which only happens once per rendered frame).
+    void pump_proc();
+
     void handle_description_locked(uint64 peer_id, const std::string &sdp, bool is_offer);
     void restart_agent_locked(uint64 peer_id, const std::string &offer_sdp);
     void send_description_locked(Peer &peer, const char *type);
@@ -233,7 +243,7 @@ private:
     void send_pending_reliable_locked();
     void handle_ice_packet_locked(Peer &peer, const std::vector<char> &packet);
     // Periodically pings connected peers (RTT) and refreshes the selected
-    // candidate pair type. Runs on the network thread inside Run().
+    // candidate pair type. Runs on the pump thread inside Run().
     void update_peer_stats_locked(std::chrono::steady_clock::time_point now);
 
     // ---- virtual endpoint derivation ----
@@ -277,6 +287,11 @@ private:
     // Events pushed by libjuice callbacks (agent threads) and drained by Run().
     std::deque<JuiceEvent> juice_events{};
     std::mutex juice_events_mutex{};
+
+    // Dedicated pump thread (see pump_proc()). Started in the constructor,
+    // stopped and joined at the top of the destructor before any teardown.
+    std::thread pump_thread{};
+    std::atomic<bool> pump_stop{false};
 
     std::recursive_mutex mutex{};
 };

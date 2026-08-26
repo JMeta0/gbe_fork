@@ -1166,7 +1166,10 @@ void Networking::Run()
     }
 
     if (ice_transport) {
-        ice_transport->Run();
+        // The ICE protocol itself runs on Ice_Transport's dedicated pump
+        // thread (ICE_PUMP_INTERVAL_MS), independent of this per-frame call.
+        // Here we only consume what the pump produced: connection state,
+        // inbound messages and disconnects.
         bool ice_ready = ice_transport->ready();
         if (ice_ready && !ice_ready_last_run) {
             trigger_ice_rediscovery("ice session restored");

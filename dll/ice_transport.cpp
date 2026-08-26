@@ -28,6 +28,12 @@ constexpr size_t MAX_PENDING_RELIABLE = 256;
 // type re-checked. Small frames over the active ICE path; 2s keeps the overlay
 // stats fresh without measurable overhead.
 constexpr int ICE_PING_INTERVAL_MS = 2000;
+// Cadence of the dedicated pump thread. The ICE protocol (juice event
+// draining, signaling, retries, pings) runs here instead of inside the game's
+// per-frame SteamAPI_RunCallbacks, so it keeps flowing at a fixed ~5ms even
+// when the render loop stalls. Requires the 1ms Windows timer resolution
+// (timeBeginPeriod), requested once by pump_proc().
+constexpr int ICE_PUMP_INTERVAL_MS = 5;
 // How long to keep an established ICE session after signaling reports the peer
 // disconnected before presuming it gone. Peers broadcast announces every ~5s,
 // so any live peer clears the grace flag well within this window; a process
@@ -38,10 +44,15 @@ constexpr double ICE_DISCONNECT_GRACE_SEC = 8.0;
 // that receives no fragment for this long is unrecoverable; keeping it would
 // only leak memory.
 constexpr double ICE_REASSEMBLY_GC_SEC = 10.0;
-// Upper bound for the libjuice callback event queue. While the network thread
+// Upper bound for the libjuice callback event queue. While the pump thread
 // is stalled (e.g. blocking DNS before the cache fix), callbacks keep queueing;
 // beyond this cap the oldest events are dropped so memory stays bounded.
 constexpr size_t MAX_JUICE_EVENTS = 1024;
+// Upper bound for inbound messages waiting for the game to drain them (the
+// pump thread fills this queue at packet rate; the game drains per frame, the
+// 300ms fallback thread when it stalls). Oldest messages are dropped beyond
+// the cap so memory stays bounded during a long game stall.
+constexpr size_t MAX_INBOUND_PACKETS = 1024;
 
 struct IceHeader {
     uint8 version = ICE_VERSION;
@@ -259,11 +270,23 @@ Ice_Transport::Ice_Transport(
     ws.set_state_callback([this](bool connected) { ws_state_handler(connected); });
     ws.configure(signaling_host, signaling_port, peer_id_string(primary_id()), signaling_secret);
 
+    // Start the dedicated protocol pump so the ICE layer ticks at a fixed
+    // ~5ms regardless of how often the game calls SteamAPI_RunCallbacks.
+    pump_thread = std::thread(&Ice_Transport::pump_proc, this);
+
     PRINT_DEBUG("ice transport created host='%s' port=%u appid=%u ids=%llu stun='%s:%u' turn='%s:%u' user='%s'", signaling_host.c_str(), signaling_port, appid, static_cast<unsigned long long>(primary_id()), stun_host.c_str(), stun_port, turn_host.c_str(), turn_port, turn_user.c_str());
 }
 
 Ice_Transport::~Ice_Transport()
 {
+    // Stop and join the pump thread FIRST, before any teardown: the pump may
+    // be mid-Run() (holding the mutex briefly) and must never observe
+    // half-destroyed peers/agents/ws state.
+    pump_stop.store(true);
+    if (pump_thread.joinable()) {
+        pump_thread.join();
+    }
+
     std::vector<AgentContext *> to_destroy{};
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
@@ -405,14 +428,14 @@ uint16 Ice_Transport::derive_virtual_port(uint64 id) const
 
 // ---- WebSocket signaling ----
 
-// NOTE on lock order: this callback runs on the network thread while the WS
+// NOTE on lock order: this callback runs on the pump thread while the WS
 // client holds its own mutex (Run()/close_locked()), so the order here is
 // ws-mutex -> ice-mutex. Everywhere else the order is ice-mutex -> ws-mutex
 // (e.g. Ice_Transport::Send -> WS_Client::send). This inversion only works
 // because both mutexes are recursive and the callbacks fire on the same thread
-// that already holds the ice-mutex (Ice_Transport::Run()). Do not add any path
-// that invokes a WS callback from a thread not already holding the ice-mutex,
-// or decouple the callback via the ws_inbox first.
+// that already holds the ice-mutex (Ice_Transport::Run() on the pump thread).
+// Do not add any path that invokes a WS callback from a thread not already
+// holding the ice-mutex, or decouple the callback via the ws_inbox first.
 
 void Ice_Transport::ws_state_handler(bool connected)
 {
@@ -457,7 +480,7 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
     // string is expected) makes json.value()/get<>() throw a
     // nlohmann::json::type_error. json::parse already runs with
     // allow_exceptions=false; the try/catch covers the extractions below so a
-    // malformed message can never crash the network thread.
+    // malformed message can never crash the pump thread.
     try {
     auto json = nlohmann::json::parse(payload, nullptr, false);
     if (json.is_discarded() || !json.is_object()) return;
@@ -1275,6 +1298,14 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
     inbound.reliable = (header.flags & ICE_FLAG_RELIABLE) != 0;
     inbound.ip_port.ip = htonl(peer.virtual_ip);
     inbound.ip_port.port = htons(peer.virtual_port);
+    // The pump thread fills this queue independently of the game's frame
+    // loop. If the game (and its 300ms fallback drain) stalls for a long
+    // time, bound the backlog by dropping the oldest messages instead of
+    // growing without limit; a game that far behind is better served by
+    // fresh data anyway.
+    if (inbound_packets.size() >= MAX_INBOUND_PACKETS) {
+        inbound_packets.pop_front();
+    }
     inbound_packets.push_back(std::move(inbound));
 }
 
@@ -1517,4 +1548,25 @@ void Ice_Transport::Run()
     // juice_destroy joins the agent thread, which may still be executing a
     // callback, so agents are destroyed without holding the lock.
     destroy_queued_agents();
+}
+
+void Ice_Transport::pump_proc()
+{
+#if defined(STEAM_WIN32)
+    // The default Windows timer resolution is ~15.6ms, which would silently
+    // defeat the ~5ms pump cadence. Request the 1ms resolution for the
+    // lifetime of this thread and release it on exit.
+    timeBeginPeriod(1);
+#endif
+
+    while (!pump_stop.load()) {
+        // Run() takes the transport mutex itself and early-returns when the
+        // transport is disabled, so a straight call is all the loop needs.
+        Run();
+        std::this_thread::sleep_for(std::chrono::milliseconds(ICE_PUMP_INTERVAL_MS));
+    }
+
+#if defined(STEAM_WIN32)
+    timeEndPeriod(1);
+#endif
 }

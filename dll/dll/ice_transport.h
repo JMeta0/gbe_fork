@@ -6,6 +6,7 @@
 
 #include <juice/juice.h>
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <map>
@@ -101,13 +102,9 @@ public:
         // peer is presumed gone and removed (fast friend-list cleanup).
         std::chrono::steady_clock::time_point signal_disconnected_at{};
 
-        // ---- telemetry (updated by Run() on the network thread) ----
-        // Ping (RTT) over the active ICE path via ICE_PKT_PING/PONG frames,
-        // plus the selected candidate pair type, exposed to the overlay.
-        std::chrono::steady_clock::time_point next_ping_at{}; // cadence for ping/type refresh
-        std::chrono::steady_clock::time_point ping_sent_at{};
-        uint64 ping_token = 0;
-        int rtt_ms = -1; // last measured round-trip in ms, -1 = no sample yet
+        // Cadence for the 2s ping / connection-type refresh. Only touched by
+        // update_peer_stats_locked() on the network thread.
+        std::chrono::steady_clock::time_point next_ping_at{};
         PeerConnectionType connection_type = PeerConnectionType::Unknown;
     };
 
@@ -160,6 +157,19 @@ private:
         int host_candidates = 0;
         int srflx_candidates = 0;
         int relay_candidates = 0;
+        // Snapshot of our primary id taken at agent creation (under the
+        // transport mutex), so the PING fast path can reply on the agent
+        // thread without reading local_ids.
+        uint64 primary_id = 0;
+        // ---- fast-path ping state (RTT over the active ICE path) ----
+        // Armed by update_peer_stats_locked() on the network thread, answered
+        // and stamped by juice_recv()/handle_pong_fast() on the agent thread
+        // the moment the PONG arrives. Atomic so neither side needs the
+        // transport mutex. ping_sent_at_us is the steady-clock timestamp in
+        // microseconds (the same value as the PING token).
+        std::atomic<uint64_t> ping_token{0};
+        std::atomic<int64_t> ping_sent_at_us{0};
+        std::atomic<int> rtt_ms{-1}; // last measured round-trip in ms, -1 = no sample yet
     };
 
     // Events queued by libjuice callbacks and processed on the network thread
@@ -186,6 +196,10 @@ private:
     static void juice_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr);
     static void juice_gathering_done(juice_agent_t *agent, void *user_ptr);
     static void juice_recv(juice_agent_t *agent, const char *data, size_t size, void *user_ptr);
+    // Fast path for an incoming PONG: runs on the agent thread, matches the
+    // token armed by update_peer_stats_locked() and stamps the RTT without
+    // touching the transport mutex.
+    void handle_pong_fast(AgentContext *ctx, uint64 token);
 
     // ---- WebSocket callbacks (run on the network thread inside Run()) ----
     void ws_message_handler(std::string &&payload);

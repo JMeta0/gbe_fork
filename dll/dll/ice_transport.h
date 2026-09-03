@@ -67,11 +67,12 @@ public:
 
     // How two peers are actually connected, derived from the ICE selected
     // candidate pair: relayed through a TURN server, P2P through NAT (reflexive
-    // address discovered via STUN), or a direct host-to-host path.
+    // address discovered via STUN or learned from connectivity checks), or a
+    // direct host-to-host path.
     enum class PeerConnectionType {
         Unknown = 0,
         Direct, // host-host, no server involved
-        Stun,   // server-reflexive (srflx), P2P via STUN-discovered address
+        Stun,   // srflx/prflx, P2P via NAT hole punching
         Turn,   // relayed through the TURN server
     };
 

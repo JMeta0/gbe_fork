@@ -210,7 +210,12 @@ Ice_Transport::PeerConnectionType selected_candidate_connection_type(juice_agent
     if (strstr(local, "typ relay") || strstr(remote, "typ relay")) {
         return Ice_Transport::PeerConnectionType::Turn;
     }
-    if (strstr(local, "typ srflx") || strstr(remote, "typ srflx")) {
+    // Peer-reflexive candidates are learned during connectivity checks when the
+    // peer's actual source address differs from every announced candidate (e.g.
+    // symmetric NAT). The path is still P2P NAT traversal, so group it with
+    // srflx under Stun instead of mislabeling it as a direct host-host path.
+    if (strstr(local, "typ srflx") || strstr(remote, "typ srflx") ||
+        strstr(local, "typ prflx") || strstr(remote, "typ prflx")) {
         return Ice_Transport::PeerConnectionType::Stun;
     }
     return Ice_Transport::PeerConnectionType::Direct;

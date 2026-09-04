@@ -1383,7 +1383,14 @@ EResult Steam_Networking_Sockets::ConfigureConnectionLanes( HSteamNetConnection 
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
     auto connect_socket = sbcs->connect_sockets.find(hConn);
     if (connect_socket == sbcs->connect_sockets.end()) return k_EResultNoConnection;
-    //TODO
+    // P1-D: validate and store the lane count. Priorities/weights are
+    // accepted but not scheduled yet (single per-peer pending queue in the
+    // ICE layer); the lane value already rides on the wire for later
+    // strict-priority PING>ACK>reliable>unreliable + DRR across peers.
+    if (nNumLanes <= 0 || nNumLanes > 16) return k_EResultInvalidParam;
+    (void)pLanePriorities;
+    (void)pLaneWeights;
+    connect_socket->second.num_lanes = nNumLanes;
     return k_EResultOK;
 }
 

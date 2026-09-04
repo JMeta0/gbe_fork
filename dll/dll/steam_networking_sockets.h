@@ -62,6 +62,12 @@ struct Connect_Socket {
     unsigned long long packet_send_counter{};
     CSteamID created_by{};
 
+    // P1-D: per-connection lane configuration (ConfigureConnectionLanes).
+    // Stored here so the ICE layer can schedule per-lane later; today the
+    // transport keeps one pending queue per peer and the lane rides on the
+    // wire (Networking_Sockets.lane) for future strict-priority/DRR.
+    int num_lanes = 1;
+
     std::chrono::steady_clock::time_point connect_request_last_sent{};
     unsigned connect_requests_sent{};
 };

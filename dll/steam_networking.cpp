@@ -19,10 +19,11 @@
 
 
 //packet timeout in seconds for non connections
-#define ORPHANED_PACKET_TIMEOUT (20)
-#define NEW_CONNECTION_TIMEOUT (20.0)
+#define ORPHANED_PACKET_TIMEOUT (8)
+#define NEW_CONNECTION_TIMEOUT (10.0)
 
-//kingdom 2 crowns doesn't work with a 0.3 delay or lower
+// Intentionally unchanged at 0.4s: kingdom 2 crowns breaks with 0.3s or
+// lower (see old comment). Not a tuning knob.
 #define NEW_CONNECTION_DELAY (0.4)
 
 #define OLD_CHANNEL_NUMBER 1

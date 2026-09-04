@@ -195,8 +195,24 @@ static inline void reset_LastError()
         PRINT_DEBUG_CLEANUP();                                                                      \
     } while (0)
 
+    // Per-packet network detail. Same sink as PRINT_DEBUG but behind its own
+    // gate so TRACE stays off by default even in debug builds. Enable by
+    // defining EMU_ENABLE_TRACE at compile time (debug only); in release
+    // (EMU_RELEASE_BUILD) both macros compile out.
+    // High-frequency network/packet logs must use PRINT_TRACE, not
+    // PRINT_DEBUG, with ~1s aggregated DEBUG rollups for "traffic flowing".
+#if !defined(EMU_RELEASE_BUILD) && defined(EMU_ENABLE_TRACE)
+    #define PRINT_TRACE(a, ...) do {                                                                \
+        dbg_logger.write("[tid %lld] %s " a, PRINT_DEBUG_TID(), EMU_FUNC_NAME, ##__VA_ARGS__);      \
+        PRINT_DEBUG_CLEANUP();                                                                      \
+    } while (0)
+#else
+    #define PRINT_TRACE(...)
+#endif
+
 #else // EMU_RELEASE_BUILD
     #define PRINT_DEBUG(...)
+    #define PRINT_TRACE(...)
 #endif // EMU_RELEASE_BUILD
 
 // function entry

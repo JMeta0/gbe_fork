@@ -3,6 +3,7 @@
 #include "json/json.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -22,28 +23,34 @@ constexpr uint8 ICE_PKT_PING = 5;
 constexpr uint8 ICE_PKT_PONG = 6;
 constexpr uint32 ICE_FLAG_RELIABLE = 1u << 0;
 constexpr size_t ICE_FRAGMENT_MTU = 1100;
-constexpr int ICE_RELIABLE_RETRY_MS = 250;
+constexpr int ICE_RTO_INITIAL_MS = 250;
+constexpr int ICE_RTO_MIN_MS = 50;
+constexpr int ICE_RTO_MAX_MS = 1000;
 constexpr size_t MAX_PENDING_RELIABLE = 256;
 // How often a connected peer is pinged (RTT) and its selected candidate pair
 // type re-checked. Small frames over the active ICE path; 2s keeps the overlay
 // stats fresh without measurable overhead.
 constexpr int ICE_PING_INTERVAL_MS = 2000;
-// Cadence of the dedicated pump thread. The ICE protocol (juice event
-// draining, signaling, retries, pings) runs here instead of inside the game's
-// per-frame SteamAPI_RunCallbacks, so it keeps flowing at a fixed ~10ms even
-// when the render loop stalls. Requires the 1ms Windows timer resolution
-// (timeBeginPeriod), requested once by pump_proc().
-constexpr int ICE_PUMP_INTERVAL_MS = 10;
+// P2-E: the selected candidate pair barely changes mid-session; re-classify
+// at most every 10s instead of strstr() on every 2s ping tick.
+constexpr int ICE_CONN_TYPE_REFRESH_MS = 10000;
+// Cadence of the dedicated pump thread fallback wait. The pump is woken
+// immediately by juice/ws events via pump_wake_cv; the wait_for() fallback
+// only bounds the damage of a missed notify. Fast path (event drain, send,
+// ACK/PING/PONG) therefore runs at event latency instead of a fixed 10ms
+// poll quantization; slow path (list, stats, GC, rollup) stays cadenced.
+constexpr int ICE_PUMP_FALLBACK_MS = 2;
+constexpr int ICE_PUMP_INTERVAL_MS = 10; // slow-path cadence only (kept for tuning compat)
 // How long to keep an established ICE session after signaling reports the peer
 // disconnected before presuming it gone. Peers broadcast announces every ~5s,
 // so any live peer clears the grace flag well within this window; a process
 // that quit stays silent and is removed (friend list updated) shortly after.
 constexpr double ICE_DISCONNECT_GRACE_SEC = 8.0;
 // How long an incomplete incoming message may sit in peer.reassembly before it
-// is garbage-collected. The sender retries every 250ms, so a partial message
-// that receives no fragment for this long is unrecoverable; keeping it would
-// only leak memory.
-constexpr double ICE_REASSEMBLY_GC_SEC = 10.0;
+// is garbage-collected. The sender retries on its adaptive RTO (initial
+// 250ms, backoff to 1s), so a partial message that receives no fragment for
+// this long is unrecoverable; keeping it would only leak memory.
+constexpr double ICE_REASSEMBLY_GC_SEC = 2.0;
 // Upper bound for the libjuice callback event queue. While the pump thread
 // is stalled (e.g. blocking DNS before the cache fix), callbacks keep queueing;
 // beyond this cap the oldest events are dropped so memory stays bounded.
@@ -91,6 +98,29 @@ void append_u64(std::vector<char> &out, uint64 value)
     }
 }
 
+// Wire size of IceHeader on the wire (GPTN v1): magic(4) + ver(1) + type(1)
+// + reserved(2) + flags(4) + seq(4) + ack(4) + ack_bits(4) + src(8) + dst(8)
+// + token(8) + msg_id(4) + frag_idx(2) + frag_cnt(2) + payload_len(4) = 60.
+constexpr size_t ICE_HEADER_SIZE = 60;
+
+void append_ice_header(std::vector<char> &out, const IceHeader &header)
+{
+    append_u32(out, ICE_MAGIC);
+    out.push_back(static_cast<char>(header.version));
+    out.push_back(static_cast<char>(header.type));
+    append_u16(out, header.reserved);
+    append_u32(out, header.flags);
+    append_u32(out, header.packet_seq);
+    append_u32(out, header.ack);
+    append_u32(out, header.ack_bits);
+    append_u64(out, header.source_id);
+    append_u64(out, header.dest_id);
+    append_u64(out, header.token);
+    append_u32(out, header.message_id);
+    append_u16(out, header.fragment_index);
+    append_u16(out, header.fragment_count);
+}
+
 bool read_u16(const std::vector<char> &in, size_t &offset, uint16 &value)
 {
     if (offset + 2 > in.size()) return false;
@@ -126,23 +156,20 @@ bool read_u64(const std::vector<char> &in, size_t &offset, uint64 &value)
 std::vector<char> serialize_ice_header(const IceHeader &header, const std::vector<char> &payload)
 {
     std::vector<char> out{};
-    append_u32(out, ICE_MAGIC);
-    out.push_back(static_cast<char>(header.version));
-    out.push_back(static_cast<char>(header.type));
-    append_u16(out, header.reserved);
-    append_u32(out, header.flags);
-    append_u32(out, header.packet_seq);
-    append_u32(out, header.ack);
-    append_u32(out, header.ack_bits);
-    append_u64(out, header.source_id);
-    append_u64(out, header.dest_id);
-    append_u64(out, header.token);
-    append_u32(out, header.message_id);
-    append_u16(out, header.fragment_index);
-    append_u16(out, header.fragment_count);
+    out.reserve(ICE_HEADER_SIZE + payload.size());
+    append_ice_header(out, header);
     append_u32(out, static_cast<uint32>(payload.size()));
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
+}
+
+// Zero-alloc variant: appends a full frame into a reused thread-local buffer
+// (see tls_send_buffer below) instead of allocating per fragment.
+void serialize_ice_header_into(std::vector<char> &out, const IceHeader &header, const char *payload, size_t payload_size)
+{
+    append_ice_header(out, header);
+    append_u32(out, static_cast<uint32>(payload_size));
+    out.insert(out.end(), payload, payload + payload_size);
 }
 
 bool deserialize_ice_header(const std::vector<char> &packet, IceHeader &header, std::vector<char> &payload)
@@ -288,6 +315,7 @@ Ice_Transport::~Ice_Transport()
     // be mid-Run() (holding the mutex briefly) and must never observe
     // half-destroyed peers/agents/ws state.
     pump_stop.store(true);
+    pump_wake();
     if (pump_thread.joinable()) {
         pump_thread.join();
     }
@@ -474,8 +502,22 @@ void Ice_Transport::ws_state_handler(bool connected)
 
 void Ice_Transport::ws_message_handler(std::string &&payload)
 {
-    std::lock_guard<std::recursive_mutex> lock(mutex);
-    ws_inbox.push_back(std::move(payload));
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        ws_inbox.push_back(std::move(payload));
+    }
+    // Wake outside the transport mutex: pump_wake() only touches the wakeup
+    // mutex/CV, and the pump never takes the transport mutex while waiting.
+    pump_wake();
+}
+
+void Ice_Transport::pump_wake()
+{
+    {
+        std::lock_guard<std::mutex> wlock(pump_wake_mutex);
+        pump_wake_flag.store(true);
+    }
+    pump_wake_cv.notify_one();
 }
 
 void Ice_Transport::process_ws_message_locked(const std::string &payload)
@@ -493,7 +535,7 @@ void Ice_Transport::process_ws_message_locked(const std::string &payload)
     std::string type = json.value("type", "");
     if (type == "list") {
         size_t peer_count = json.contains("peer_ids") && json["peer_ids"].is_array() ? json["peer_ids"].size() : 0;
-        PRINT_DEBUG("ice signaling list peers=%zu", peer_count);
+        PRINT_TRACE("ice signaling list peers=%zu", peer_count);
         if (json.contains("peer_ids") && json["peer_ids"].is_array()) {
             for (const auto &item : json["peer_ids"]) {
                 if (!item.is_string()) continue;
@@ -568,7 +610,7 @@ void Ice_Transport::handle_description_locked(uint64 peer_id, const std::string 
     if (pit == peers.end() || !pit->second.agent) return;
     Peer &peer = pit->second;
     std::string preview = sdp.size() > 96 ? sdp.substr(0, 96) + "..." : sdp;
-    PRINT_DEBUG("ice remote %s peer=%llu sdp='%s'", is_offer ? "offer" : "answer", static_cast<unsigned long long>(peer_id), preview.c_str());
+    PRINT_TRACE("ice remote %s peer=%llu sdp='%s'", is_offer ? "offer" : "answer", static_cast<unsigned long long>(peer_id), preview.c_str());
 
     peer.signal_disconnected_at = {};
 
@@ -586,7 +628,7 @@ void Ice_Transport::handle_description_locked(uint64 peer_id, const std::string 
         if (res == JUICE_ERR_FAILED) {
             restart_agent_locked(peer_id, sdp);
         } else if (res == JUICE_ERR_SUCCESS) {
-            PRINT_DEBUG("ice duplicate offer ignored peer=%llu", static_cast<unsigned long long>(peer_id));
+            PRINT_TRACE("ice duplicate offer ignored peer=%llu", static_cast<unsigned long long>(peer_id));
         }
         return;
     }
@@ -596,7 +638,7 @@ void Ice_Transport::handle_description_locked(uint64 peer_id, const std::string 
     } else {
         peer.remote_description_set = true;
         for (const auto &cand : peer.pending_remote_candidates) {
-            PRINT_DEBUG("ice replay pending candidate peer=%llu", static_cast<unsigned long long>(peer_id));
+            PRINT_TRACE("ice replay pending candidate peer=%llu", static_cast<unsigned long long>(peer_id));
             if (juice_add_remote_candidate(peer.agent, cand.c_str()) < 0) {
                 PRINT_DEBUG("ice add remote candidate failed peer=%llu", static_cast<unsigned long long>(peer_id));
             }
@@ -630,6 +672,11 @@ void Ice_Transport::restart_agent_locked(uint64 peer_id, const std::string &offe
     peer.highest_remote_seq = 0;
     peer.remote_ack_bits = 0;
     peer.next_message_id = 1;
+    // Fresh session, fresh path: drop the old RTT estimate and fast-RTX
+    // guard so the new agent starts at the initial RTO.
+    peer.srtt_ms = -1.0;
+    peer.rttvar_ms = 0.0;
+    peer.last_fast_rtx_ack = 0;
     // pending_remote_candidates is kept: they are replayed once the new agent
     // has the new remote description (and survive a create failure).
     peer.remote_description_set = false;
@@ -696,7 +743,7 @@ void Ice_Transport::send_description_locked(Peer &peer, const char *type)
     json["sdp"] = sdp;
     std::string preview = sdp;
     if (preview.size() > 96) preview = preview.substr(0, 96) + "...";
-    PRINT_DEBUG("ice local %s -> peer=%llu dest='%s' sdp='%s'", type, static_cast<unsigned long long>(peer.primary_id), peer.signaling_id.c_str(), preview.c_str());
+    PRINT_TRACE("ice local %s -> peer=%llu dest='%s' sdp='%s'", type, static_cast<unsigned long long>(peer.primary_id), peer.signaling_id.c_str(), preview.c_str());
     if (!ws.send(json.dump())) {
         PRINT_DEBUG("ice %s send failed peer=%llu", type, static_cast<unsigned long long>(peer.primary_id));
     }
@@ -708,10 +755,10 @@ void Ice_Transport::handle_candidate_locked(uint64 peer_id, const std::string &c
     if (pit == peers.end() || !pit->second.agent) return;
     Peer &peer = pit->second;
     std::string preview = candidate.size() > 96 ? candidate.substr(0, 96) + "..." : candidate;
-    PRINT_DEBUG("ice remote candidate peer=%llu sdp='%s'", static_cast<unsigned long long>(peer_id), preview.c_str());
+    PRINT_TRACE("ice remote candidate peer=%llu sdp='%s'", static_cast<unsigned long long>(peer_id), preview.c_str());
     peer.signal_disconnected_at = {};
     if (!peer.remote_description_set) {
-        PRINT_DEBUG("ice buffering candidate pending remote description peer=%llu", static_cast<unsigned long long>(peer_id));
+        PRINT_TRACE("ice buffering candidate pending remote description peer=%llu", static_cast<unsigned long long>(peer_id));
         peer.pending_remote_candidates.push_back(candidate);
         return;
     }
@@ -733,7 +780,7 @@ void Ice_Transport::send_candidate_locked(Peer &peer, const char *sdp)
     json["candidate"] = sdp;
     std::string preview = sdp ? std::string(sdp) : std::string{};
     if (preview.size() > 96) preview = preview.substr(0, 96) + "...";
-    PRINT_DEBUG("ice local candidate -> peer=%llu dest='%s' sdp='%s'", static_cast<unsigned long long>(peer.primary_id), peer.signaling_id.c_str(), preview.c_str());
+    PRINT_TRACE("ice local candidate -> peer=%llu dest='%s' sdp='%s'", static_cast<unsigned long long>(peer.primary_id), peer.signaling_id.c_str(), preview.c_str());
     if (!ws.send(json.dump())) {
         PRINT_DEBUG("ice candidate send failed peer=%llu", static_cast<unsigned long long>(peer.primary_id));
     }
@@ -919,6 +966,7 @@ void Ice_Transport::juice_state_changed(juice_agent_t *agent, juice_state_t stat
         ctx->self->juice_events.pop_front(); // bound memory; keep the newest events
     }
     ctx->self->juice_events.push_back(std::move(ev));
+    ctx->self->pump_wake();
 }
 
 void Ice_Transport::juice_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr)
@@ -944,6 +992,7 @@ void Ice_Transport::juice_candidate(juice_agent_t *agent, const char *sdp, void 
         ctx->self->juice_events.pop_front();
     }
     ctx->self->juice_events.push_back(std::move(ev));
+    ctx->self->pump_wake();
 }
 
 void Ice_Transport::juice_gathering_done(juice_agent_t *agent, void *user_ptr)
@@ -1001,6 +1050,7 @@ void Ice_Transport::juice_recv(juice_agent_t *agent, const char *data, size_t si
         ctx->self->juice_events.pop_front();
     }
     ctx->self->juice_events.push_back(std::move(ev));
+    ctx->self->pump_wake();
 }
 
 void Ice_Transport::handle_pong_fast(AgentContext *ctx, uint64 token)
@@ -1063,7 +1113,7 @@ void Ice_Transport::process_juice_events_locked()
                 remove_peer_locked(ev.peer_id, true);
                 break;
             default:
-                PRINT_DEBUG("ice peer state peer=%llu state=%u", static_cast<unsigned long long>(ev.peer_id), static_cast<unsigned>(ev.state));
+                PRINT_TRACE("ice peer state peer=%llu state=%u", static_cast<unsigned long long>(ev.peer_id), static_cast<unsigned>(ev.state));
                 break;
             }
             break;
@@ -1115,11 +1165,17 @@ bool Ice_Transport::send_fragments_locked(Peer &peer, uint64 dest_id, const std:
     uint32 message_id = peer.next_message_id++;
     uint64 source_id = primary_id();
     auto now = std::chrono::steady_clock::now();
+    // Adaptive RTO from the smoothed RTT (RFC 6298-style, clamped). First
+    // message to a peer has no sample yet -> initial 250ms (old behavior).
+    int rto_ms = ICE_RTO_INITIAL_MS;
+    if (peer.srtt_ms >= 0.0) {
+        rto_ms = static_cast<int>(peer.srtt_ms + 4.0 * peer.rttvar_ms);
+        rto_ms = std::max(ICE_RTO_MIN_MS, std::min(ICE_RTO_MAX_MS, rto_ms));
+    }
 
     for (uint16 fragment_index = 0; fragment_index < fragment_count; ++fragment_index) {
         size_t offset = static_cast<size_t>(fragment_index) * ICE_FRAGMENT_MTU;
         size_t chunk = std::min(ICE_FRAGMENT_MTU, payload.size() - offset);
-        std::vector<char> fragment(payload.begin() + static_cast<std::ptrdiff_t>(offset), payload.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
         uint32 seq = peer.next_packet_seq++;
         uint32 flags = reliable ? ICE_FLAG_RELIABLE : 0;
 
@@ -1135,16 +1191,18 @@ bool Ice_Transport::send_fragments_locked(Peer &peer, uint64 dest_id, const std:
         header.ack = peer.highest_remote_seq;
         header.ack_bits = peer.remote_ack_bits;
 
-        std::vector<char> bytes = serialize_ice_header(header, fragment);
-
+        // Queue reliable fragments *before* the send attempt: a transient
+        // juice_send failure (TURN channel bind in progress, momentary missing
+        // selected entry, socket would-block) must not lose the message.
+        // send_pending_reliable_locked() retries queued fragments until ACKed.
+        std::vector<char> bytes{};
         if (reliable) {
-            // Queue reliable fragments *before* the send attempt: a transient
-            // juice_send failure (TURN channel bind in progress, momentary missing
-            // selected entry, socket would-block) must not lose the message.
-            // send_pending_reliable_locked() retries queued fragments until ACKed.
+            serialize_ice_header_into(bytes, header,
+                chunk ? payload.data() + static_cast<std::ptrdiff_t>(offset) : nullptr, chunk);
             PendingPacket pending{};
             pending.bytes = bytes;
-            pending.next_send = now + std::chrono::milliseconds(ICE_RELIABLE_RETRY_MS);
+            pending.next_send = now + std::chrono::milliseconds(rto_ms);
+            pending.first_send = now;
             pending.message_id = message_id;
             peer.pending[seq] = std::move(pending);
 
@@ -1161,8 +1219,12 @@ bool Ice_Transport::send_fragments_locked(Peer &peer, uint64 dest_id, const std:
                 auto it = peer.pending.begin();
                 while (it != peer.pending.end() && it->second.message_id == evict_message) {
                     it = peer.pending.erase(it);
+                    ++traffic_counters.evicts;
                 }
             }
+        } else {
+            serialize_ice_header_into(bytes, header,
+                chunk ? payload.data() + static_cast<std::ptrdiff_t>(offset) : nullptr, chunk);
         }
 
         if (juice_send(peer.agent, bytes.data(), bytes.size()) != JUICE_ERR_SUCCESS) {
@@ -1170,6 +1232,8 @@ bool Ice_Transport::send_fragments_locked(Peer &peer, uint64 dest_id, const std:
             // Reliable fragments are queued above; the retry loop will deliver them.
             continue;
         }
+        ++traffic_counters.msgs_sent;
+        traffic_counters.bytes_sent += bytes.size();
     }
     return true;
 }
@@ -1180,13 +1244,24 @@ void Ice_Transport::send_pending_reliable_locked()
     for (auto &[peer_id, peer] : peers) {
         (void)peer_id;
         if (!peer.agent || !peer.connected) continue;
+        // Adaptive RTO from the smoothed RTT (RFC 6298-style, clamped).
+        int rto_ms = ICE_RTO_INITIAL_MS;
+        if (peer.srtt_ms >= 0.0) {
+            rto_ms = static_cast<int>(peer.srtt_ms + 4.0 * peer.rttvar_ms);
+            rto_ms = std::max(ICE_RTO_MIN_MS, std::min(ICE_RTO_MAX_MS, rto_ms));
+        }
         for (auto &[seq, pending] : peer.pending) {
             (void)seq;
             if (now < pending.next_send) continue;
-            // Advance the retry timestamp whether or not the send succeeded, so
-            // a persistently failing peer retries at the 250ms cadence instead
-            // of spinning at tick rate.
-            pending.next_send = now + std::chrono::milliseconds(ICE_RELIABLE_RETRY_MS);
+            // Exponential backoff per generation, capped at RTO_MAX: a
+            // persistently failing peer backs off instead of spinning at the
+            // base RTO. ACK progress resets the generation (see
+            // handle_ice_packet_locked).
+            int delay_ms = rto_ms << std::min(pending.backoff_step, 4);
+            delay_ms = std::min(delay_ms, ICE_RTO_MAX_MS);
+            pending.next_send = now + std::chrono::milliseconds(delay_ms);
+            if (pending.backoff_step < 8) ++pending.backoff_step;
+            ++traffic_counters.retries;
             juice_send(peer.agent, pending.bytes.data(), pending.bytes.size());
         }
     }
@@ -1206,13 +1281,51 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
 
     // process acknowledgments for our reliable packets
     if (header.ack != 0 || header.ack_bits != 0) {
-        auto remove_ack = [&](uint32 seq) {
+        // RTT sample from the highest newly-ACKed fragment (Karn: only
+        // fragments sent once — retransmitted ones would skew the sample).
+        // Feeds peer.srtt_ms/rttvar_ms for the adaptive RTO above.
+        auto sample_rtt = [&](uint32 seq) {
             auto it = peer.pending.find(seq);
-            if (it != peer.pending.end()) peer.pending.erase(it);
+            if (it == peer.pending.end()) return;
+            bool retransmitted = it->second.backoff_step > 0;
+            auto first = it->second.first_send;
+            peer.pending.erase(it);
+            if (retransmitted) return;
+            if (first == std::chrono::steady_clock::time_point{}) return;
+            double rtt = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - first).count();
+            if (peer.srtt_ms < 0.0) {
+                peer.srtt_ms = rtt;
+                peer.rttvar_ms = rtt / 2.0;
+            } else {
+                peer.rttvar_ms = 0.75 * peer.rttvar_ms + 0.25 * std::abs(peer.srtt_ms - rtt);
+                peer.srtt_ms = 0.875 * peer.srtt_ms + 0.125 * rtt;
+            }
         };
-        remove_ack(header.ack);
+        sample_rtt(header.ack);
         for (uint32 bit = 0; bit < 32; ++bit) {
-            if (header.ack_bits & (1u << bit)) remove_ack(header.ack - (bit + 1));
+            if (header.ack_bits & (1u << bit)) sample_rtt(header.ack - (bit + 1));
+        }
+        // Fast retransmit on ACK gap: the ack_bits mark which of the 32
+        // packets before header.ack arrived. A packet with a NEWER packet
+        // already ACKed (bit set above its position) was likely lost, not
+        // just delayed — resend it now instead of waiting for the RTO.
+        // Guard: only when the ACK advances (avoids duplicate-ACK storms).
+        if (seq_is_more_recent(header.ack, peer.last_fast_rtx_ack)) {
+            peer.last_fast_rtx_ack = header.ack;
+            for (uint32 bit = 0; bit < 32; ++bit) {
+                if (!(header.ack_bits & (1u << bit))) {
+                    uint32 missing = header.ack - (bit + 1);
+                    auto it = peer.pending.find(missing);
+                    if (it != peer.pending.end() && peer.agent) {
+                        it->second.next_send = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(ICE_RTO_MIN_MS);
+                        it->second.backoff_step = 0;
+                        ++traffic_counters.retries;
+                        juice_send(peer.agent, it->second.bytes.data(), it->second.bytes.size());
+                    }
+                }
+            }
         }
     }
 
@@ -1304,14 +1417,17 @@ void Ice_Transport::handle_ice_packet_locked(Peer &peer, const std::vector<char>
     inbound.ip_port.ip = htonl(peer.virtual_ip);
     inbound.ip_port.port = htons(peer.virtual_port);
     // The pump thread fills this queue independently of the game's frame
-    // loop. If the game (and its 300ms fallback drain) stalls for a long
+    // loop. If the game (and its fallback drain) stalls for a long
     // time, bound the backlog by dropping the oldest messages instead of
     // growing without limit; a game that far behind is better served by
     // fresh data anyway.
     if (inbound_packets.size() >= MAX_INBOUND_PACKETS) {
         inbound_packets.pop_front();
+        ++traffic_counters.drops;
     }
     inbound_packets.push_back(std::move(inbound));
+    ++traffic_counters.msgs_recvd;
+    traffic_counters.bytes_recvd += packet.size();
 }
 
 void Ice_Transport::update_peer_stats_locked(std::chrono::steady_clock::time_point now)
@@ -1323,7 +1439,12 @@ void Ice_Transport::update_peer_stats_locked(std::chrono::steady_clock::time_poi
         peer.next_ping_at = now + std::chrono::milliseconds(ICE_PING_INTERVAL_MS);
 
         // Refresh the connection type from the ICE selected candidate pair.
-        peer.connection_type = selected_candidate_connection_type(peer.agent);
+        // P2-E: cache it — refresh at most every ICE_CONN_TYPE_REFRESH_MS
+        // instead of strstr() over both SDP strings on every ping tick.
+        if (now >= peer.next_conn_type_at) {
+            peer.next_conn_type_at = now + std::chrono::milliseconds(ICE_CONN_TYPE_REFRESH_MS);
+            peer.connection_type = selected_candidate_connection_type(peer.agent);
+        }
 
         auto cit = agent_ctx.find(peer.agent);
         if (cit == agent_ctx.end() || !cit->second) continue;
@@ -1390,10 +1511,13 @@ bool Ice_Transport::Send(Common_Message *msg, bool reliable)
     Peer *peer = find_peer_locked(dest_id);
     if (!peer || !peer->connected) return false;
 
+    // Thread-local reusable payload buffer (P1-C): avoids one alloc per send
+    // on the pump/API threads. send_fragments_locked copies what it needs.
+    thread_local std::vector<char> tls_payload{};
     size_t size = msg->ByteSizeLong();
-    std::vector<char> payload(size);
-    msg->SerializeToArray(payload.data(), static_cast<int>(payload.size()));
-    return send_fragments_locked(*peer, dest_id, payload, reliable);
+    tls_payload.resize(size);
+    if (size) msg->SerializeToArray(tls_payload.data(), static_cast<int>(size));
+    return send_fragments_locked(*peer, dest_id, tls_payload, reliable);
 }
 
 bool Ice_Transport::SendToEndpoint(Common_Message *msg, uint32 ip, uint16 port, bool reliable)
@@ -1407,10 +1531,11 @@ bool Ice_Transport::SendToEndpoint(Common_Message *msg, uint32 ip, uint16 port, 
     }
     if (!peer || !peer->connected) return false;
 
+    thread_local std::vector<char> tls_payload{};
     size_t size = msg->ByteSizeLong();
-    std::vector<char> payload(size);
-    msg->SerializeToArray(payload.data(), static_cast<int>(payload.size()));
-    return send_fragments_locked(*peer, msg->dest_id(), payload, reliable);
+    tls_payload.resize(size);
+    if (size) msg->SerializeToArray(tls_payload.data(), static_cast<int>(size));
+    return send_fragments_locked(*peer, msg->dest_id(), tls_payload, reliable);
 }
 
 bool Ice_Transport::SendBroadcast(Common_Message *msg)
@@ -1418,9 +1543,12 @@ bool Ice_Transport::SendBroadcast(Common_Message *msg)
     if (!msg) return false;
     std::lock_guard<std::recursive_mutex> lock(mutex);
 
+    // Serialize once (P1-C): the old code did N× SerializeToArray inside the
+    // peer loop via send_fragments_locked payload copies; the payload is now
+    // serialized a single time and shared across peers.
     size_t size = msg->ByteSizeLong();
     std::vector<char> payload(size);
-    msg->SerializeToArray(payload.data(), static_cast<int>(payload.size()));
+    if (size) msg->SerializeToArray(payload.data(), static_cast<int>(payload.size()));
 
     bool sent = false;
     for (auto &[peer_id, peer] : peers) {
@@ -1535,9 +1663,9 @@ void Ice_Transport::Run()
 
         // Garbage-collect incomplete reassembly state. A partial message that
         // has received no fragment for ICE_REASSEMBLY_GC_SEC cannot complete
-        // (the sender retries every 250ms, so silence means the fragments are
-        // lost); dropping it bounds peer.reassembly instead of leaking an entry
-        // per lost message.
+        // (the sender retries on its adaptive RTO, so silence means the
+        // fragments are lost); dropping it bounds peer.reassembly instead of
+        // leaking an entry per lost message.
         for (auto &[peer_id, peer] : peers) {
             (void)peer_id;
             for (auto it = peer.reassembly.begin(); it != peer.reassembly.end();) {
@@ -1548,6 +1676,9 @@ void Ice_Transport::Run()
                 }
             }
         }
+
+        // 1s aggregated traffic line at DEBUG; per-packet detail is TRACE.
+        emit_traffic_rollup_locked(now);
     }
 
     // juice_destroy joins the agent thread, which may still be executing a
@@ -1555,11 +1686,48 @@ void Ice_Transport::Run()
     destroy_queued_agents();
 }
 
+void Ice_Transport::emit_traffic_rollup_locked(std::chrono::steady_clock::time_point now)
+{
+    if (next_traffic_rollup == std::chrono::steady_clock::time_point{}) {
+        next_traffic_rollup = now + std::chrono::seconds(1);
+        return;
+    }
+    if (now < next_traffic_rollup) return;
+    next_traffic_rollup = now + std::chrono::seconds(1);
+
+    size_t peer_count = peers.size();
+    size_t connected_count = 0;
+    int best_rtt = -1;
+    for (const auto &[peer_id, peer] : peers) {
+        (void)peer_id;
+        if (!peer.connected) continue;
+        ++connected_count;
+        if (peer.agent) {
+            auto cit = agent_ctx.find(peer.agent);
+            if (cit != agent_ctx.end() && cit->second) {
+                int rtt = cit->second->rtt_ms.load();
+                if (rtt >= 0 && (best_rtt < 0 || rtt < best_rtt)) best_rtt = rtt;
+            }
+        }
+    }
+    PRINT_DEBUG("ice traffic peers=%zu connected=%zu sent=%llu/%lluB recvd=%llu/%lluB retries=%llu drops=%llu evicts=%llu rtt=%dms",
+        peer_count, connected_count,
+        static_cast<unsigned long long>(traffic_counters.msgs_sent),
+        static_cast<unsigned long long>(traffic_counters.bytes_sent),
+        static_cast<unsigned long long>(traffic_counters.msgs_recvd),
+        static_cast<unsigned long long>(traffic_counters.bytes_recvd),
+        static_cast<unsigned long long>(traffic_counters.retries),
+        static_cast<unsigned long long>(traffic_counters.drops),
+        static_cast<unsigned long long>(traffic_counters.evicts),
+        best_rtt);
+    traffic_counters = TrafficCounters{};
+}
+
 void Ice_Transport::pump_proc()
 {
 #if defined(STEAM_WIN32)
     // The default Windows timer resolution is ~15.6ms, which would silently
-    // defeat the ~10ms pump cadence. Request the 1ms resolution for the
+    // defeat the fast-path wakeup latency. Request the 1ms resolution for the
     // lifetime of this thread and release it on exit.
     timeBeginPeriod(1);
 #endif
@@ -1568,7 +1736,17 @@ void Ice_Transport::pump_proc()
         // Run() takes the transport mutex itself and early-returns when the
         // transport is disabled, so a straight call is all the loop needs.
         Run();
-        std::this_thread::sleep_for(std::chrono::milliseconds(ICE_PUMP_INTERVAL_MS));
+        pump_wake_flag.store(false);
+        // Event-driven wait: juice_recv/state_changed/candidate and
+        // ws_message_handler notify the CV, so the fast path runs at event
+        // latency instead of poll quantization. The short wait_for() fallback
+        // bounds a missed notify to ICE_PUMP_FALLBACK_MS; slow-path cadences
+        // (retries, pings, GC, rollup) are enforced by timestamps in Run().
+        // If wakeups stop arriving, raise the fallback, not the poll rate.
+        std::unique_lock<std::mutex> wlock(pump_wake_mutex);
+        pump_wake_cv.wait_for(wlock, std::chrono::milliseconds(ICE_PUMP_FALLBACK_MS),
+            [this] { return pump_wake_flag.load() || pump_stop.load(); });
+        pump_wake_flag.store(false);
     }
 
 #if defined(STEAM_WIN32)

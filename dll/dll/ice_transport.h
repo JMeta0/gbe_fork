@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -51,10 +52,14 @@ public:
     struct PendingPacket {
         std::vector<char> bytes{};
         std::chrono::steady_clock::time_point next_send{};
+        std::chrono::steady_clock::time_point first_send{};
         // Message this fragment belongs to. Fragments of one message get
         // consecutive packet seqs, so they are contiguous in peer.pending;
         // eviction uses this to drop whole messages atomically.
         uint32 message_id = 0;
+        // Backoff generation: each retry doubles the delay up to RTO_MAX_MS.
+        // Reset to 0 when the fragment is first queued or ACK progress is made.
+        int backoff_step = 0;
     };
 
     struct ReassemblyState {
@@ -94,6 +99,13 @@ public:
         uint32 remote_ack_bits = 0;
         uint32 next_message_id = 1;
         std::map<uint32, PendingPacket> pending{};
+        // Smoothed RTT (ms) over this peer's ICE path, updated from ACK
+        // arrivals; drives the adaptive RTO. -1 = no sample yet.
+        double srtt_ms = -1.0;
+        double rttvar_ms = 0.0;
+        // Highest ACK seen, guards the fast-retransmit path against
+        // duplicate-ACK storms (only advance triggers gap resends).
+        uint32 last_fast_rtx_ack = 0;
         std::map<uint32, ReassemblyState> reassembly{};
         std::deque<uint32> completed_messages{};
         std::set<uint32> completed_message_set{};
@@ -107,6 +119,8 @@ public:
         // Cadence for the 2s ping / connection-type refresh. Only touched by
         // update_peer_stats_locked() on the pump thread.
         std::chrono::steady_clock::time_point next_ping_at{};
+        // P2-E: connection_type cache deadline (refresh every 10s, not every ping).
+        std::chrono::steady_clock::time_point next_conn_type_at{};
         PeerConnectionType connection_type = PeerConnectionType::Unknown;
     };
 
@@ -228,6 +242,8 @@ private:
     // the ICE protocol never depends on the game calling SteamAPI_RunCallbacks
     // (which only happens once per rendered frame).
     void pump_proc();
+    // Wake the pump thread immediately (juice event / ws message arrived).
+    void pump_wake();
 
     void handle_description_locked(uint64 peer_id, const std::string &sdp, bool is_offer);
     void restart_agent_locked(uint64 peer_id, const std::string &offer_sdp);
@@ -288,6 +304,28 @@ private:
     // Events pushed by libjuice callbacks (agent threads) and drained by Run().
     std::deque<JuiceEvent> juice_events{};
     std::mutex juice_events_mutex{};
+    // Event-driven pump wakeup: juice/ws callbacks notify, pump_proc() waits
+    // on this with a short wait_for() fallback so no path can sleep through an
+    // event (missed notify -> at most ICE_PUMP_FALLBACK_MS extra latency).
+    std::mutex pump_wake_mutex{};
+    std::condition_variable pump_wake_cv{};
+    std::atomic<bool> pump_wake_flag{false};
+
+    // ---- 1s traffic rollup (DEBUG) ----
+    // Reuses existing counters; emitted from the pump slow path so per-packet
+    // TRACE detail is off by default and "traffic flowing" is one line/sec.
+    struct TrafficCounters {
+        uint64_t msgs_sent = 0;
+        uint64_t msgs_recvd = 0;
+        uint64_t bytes_sent = 0;
+        uint64_t bytes_recvd = 0;
+        uint64_t retries = 0;
+        uint64_t drops = 0;
+        uint64_t evicts = 0;
+    };
+    TrafficCounters traffic_counters{};
+    std::chrono::steady_clock::time_point next_traffic_rollup{};
+    void emit_traffic_rollup_locked(std::chrono::steady_clock::time_point now);
 
     // Dedicated pump thread (see pump_proc()). Started in the constructor,
     // stopped and joined at the top of the destructor before any teardown.

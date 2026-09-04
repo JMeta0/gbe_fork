@@ -3,10 +3,13 @@
 
 #include "network.h"
 
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // Minimal RFC 6455 WebSocket *client* used by the ICE transport to talk to the
@@ -67,8 +70,18 @@ private:
     bool connect_in_progress = false;
 
     std::string handshake_key{};     // base64 Sec-WebSocket-Key we sent
+    // Ring buffers with head offsets (P1-C): pop-front is O(1) instead of
+    // erase(begin) memmove. Offsets compact when the head grows past 64KB.
     std::vector<char> send_buffer{}; // raw bytes queued to the socket
+    size_t send_head = 0;
     std::vector<char> recv_buffer{}; // raw bytes read from the socket
+    size_t recv_head = 0;
+    void send_consume_locked(size_t n);
+    void recv_consume_locked(size_t n);
+    size_t send_size_locked() const { return send_buffer.size() - send_head; }
+    size_t recv_size_locked() const { return recv_buffer.size() - recv_head; }
+    const char *send_data_locked() const { return send_buffer.data() + send_head; }
+    const char *recv_data_locked() const { return recv_buffer.data() + recv_head; }
 
     // incoming frame parser state
     bool frame_have_header = false;
@@ -92,6 +105,14 @@ private:
     // configure() so a changed host is re-resolved
     std::string resolved_host{};
     uint32_t resolved_ip = 0;
+    std::chrono::steady_clock::time_point resolved_at{};
+    // Async DNS: connect() never blocks the pump on getaddrinfo. First
+    // connect for an unresolved host spawns a resolver thread joined on
+    // destruction; the pump retries connect() on its normal cadence and
+    // proceeds once the result lands (or falls back to the stale cached
+    // entry on failure).
+    std::thread dns_thread{};
+    std::atomic<bool> dns_resolving{false};
 
     MessageCallback message_cb{};
     StateCallback state_cb{};

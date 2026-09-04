@@ -19,7 +19,9 @@
 #define NETWORK_INCLUDE
 
 #include "base.h"
+#include <atomic>
 #include <curl/curl.h>
+#include <thread>
 
 #define DEFAULT_PORT 47584
 #define NUM_QUERY_PORTS 10
@@ -129,15 +131,39 @@ class Networking
 
     std::vector<struct TCP_Socket> accepted;
     std::recursive_mutex mutex;
+    // Dedicated network thread: runs Run() at NETWORK_RUN_INTERVAL_MS so
+    // inbound dispatch never depends on the game calling SteamAPI_RunCallbacks
+    // (the 300ms Steam_Client fallback stays as a watchdog only). Without
+    // this, a loading stall drops the oldest MAX_INBOUND packets.
+    std::thread run_thread{};
+    std::atomic<bool> run_stop{false};
+    void run_proc();
     // Leaf lock guarding the ice_transport pointer + in-flight calls. API
-    // threads (which may hold other locks, e.g. Steam_Friends' global_mutex,
-    // while calling sendTo/sendToIPPort) must NOT take `mutex` — the network
-    // thread holds `mutex` across callback dispatch, which would invert the
-    // lock order and deadlock. This lock is only ever the last one acquired.
+    // threads (which may hold other locks, e.g. the overlay's overlay_mutex,
+    // while calling sendTo/sendToIPPort) must NOT have this lock taken after
+    // `mutex` by another thread that goes on to acquire interface locks —
+    // that would invert the lock order and deadlock. This lock is only ever
+    // the last one acquired.
     std::recursive_mutex ice_transport_mutex;
 
     struct Network_Callback_Container callbacks[CALLBACK_IDS_MAX];
     std::vector<Common_Message> local_send;
+
+    // Callback dispatch is deferred out of the network mutex (see run_locked /
+    // dispatch_callbacks): entries are collected while `mutex` is held and
+    // invoked after it is released, under global_mutex. Interface callbacks
+    // take their own locks (overlay_mutex, ...) and API threads may hold those
+    // same locks across sendTo*() calls — invoking callbacks under `mutex`
+    // would invert that order and deadlock the game thread.
+    struct Queued_Callback {
+        Callback_Ids id{};
+        Common_Message msg{};
+    };
+    std::vector<struct Queued_Callback> callback_queue;
+    // Serializes dispatch so batches are consumed in enqueue order even when
+    // two threads call Run() concurrently (game thread + network thread).
+    // Only ever taken after global_mutex, never while holding `mutex`.
+    std::mutex callback_dispatch_mutex;
 
     struct Connection *find_connection(CSteamID id, uint32 appid = 0);
     struct Connection *new_connection(CSteamID id, uint32 appid);
@@ -156,6 +182,8 @@ class Networking
     void run_callbacks(Callback_Ids id, Common_Message *msg);
     void run_callback_user(CSteamID steam_id, bool online, uint32 appid);
     void do_callbacks_message(Common_Message *msg);
+    void run_locked();
+    void dispatch_callbacks();
 
     Common_Message create_announce(bool request);
 

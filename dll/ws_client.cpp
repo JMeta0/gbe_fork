@@ -1,5 +1,6 @@
 #include "dll/ws_client.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -21,12 +22,12 @@ constexpr uint64_t WS_MAX_FRAME_SIZE = 1ull << 20; // 1 MiB, mirroring the signa
 // (covers NAT idle drops / upstream power loss, which never surface as TCP
 // errors). The server replies to every ping with a pong, so a healthy link
 // always refreshes last_activity well inside the window.
-constexpr auto WS_PING_INTERVAL = std::chrono::seconds(15);
-constexpr auto WS_LIVENESS_TIMEOUT = std::chrono::seconds(40);
+constexpr auto WS_PING_INTERVAL = std::chrono::seconds(10);
+constexpr auto WS_LIVENESS_TIMEOUT = std::chrono::seconds(20);
 // Connect/handshake deadline: a server that accepts TCP but never completes
 // the upgrade (or a blackholed network) must not leave is_connecting() true
 // forever, which would wedge the transport's reconnect loop.
-constexpr auto WS_CONNECT_TIMEOUT = std::chrono::seconds(8);
+constexpr auto WS_CONNECT_TIMEOUT = std::chrono::seconds(4);
 // Upper bound for one reassembled (fragmented) incoming message.
 constexpr size_t WS_MAX_MESSAGE_ACCUM = 4ull << 20; // 4 MiB
 
@@ -273,8 +274,14 @@ WS_Client::WS_Client()
 
 WS_Client::~WS_Client()
 {
-    std::lock_guard<std::recursive_mutex> lock(mutex);
-    close_locked();
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        close_locked();
+    }
+    // The resolver only touches members under the mutex and is never
+    // detached, so joining here (mutex free) guarantees it cannot outlive
+    // the client. No detached capture of `this` anywhere.
+    if (dns_thread.joinable()) dns_thread.join();
 }
 
 void WS_Client::configure(const std::string &host_, uint16_t port_, const std::string &path_, const std::string &secret_)
@@ -305,7 +312,9 @@ void WS_Client::close_locked()
     ws_close_socket(sock);
     connect_in_progress = false;
     send_buffer.clear();
+    send_head = 0;
     recv_buffer.clear();
+    recv_head = 0;
     frame_have_header = false;
     frame_payload.clear();
     message_accum.clear();
@@ -362,26 +371,58 @@ void WS_Client::connect()
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (host != resolved_host || resolved_ip == 0) {
-        // Blocking DNS lookup, cached per host: only the first connect for a
-        // given endpoint pays the (potentially multi-second) resolution cost
-        // instead of every 2s retry while signaling is down.
-        struct addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo *result = nullptr;
-        if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || result == nullptr) {
-            PRINT_DEBUG("ws resolve failed host='%s'", host.c_str());
-            if (result) freeaddrinfo(result);
-            close_socket();
-            return;
+    // Async DNS with TTL: never block the pump on getaddrinfo. An unresolved
+    // or stale (>5min) host spawns a joinable resolver (see dns_thread); the
+    // pump retries connect() on its normal cadence and proceeds once the
+    // result lands, or with the stale cached entry while re-resolving.
+    constexpr auto DNS_TTL = std::chrono::minutes(5);
+    auto now_dns = std::chrono::steady_clock::now();
+    bool dns_stale = (host != resolved_host || resolved_ip == 0 ||
+        resolved_at == std::chrono::steady_clock::time_point{} ||
+        now_dns - resolved_at > DNS_TTL);
+    if (dns_stale) {
+        if (resolved_ip != 0 && host == resolved_host) {
+            addr.sin_addr.s_addr = resolved_ip; // stale fallback while re-resolving
+        } else if (!dns_resolving.exchange(true)) {
+            // We just flipped false->true, so no resolver is in flight: the
+            // previous thread object (if any) is finished and join() returns
+            // immediately without blocking the pump. Reaping is required
+            // because assigning over a joinable std::thread terminates.
+            if (dns_thread.joinable()) dns_thread.join();
+            std::string resolve_host = host;
+            dns_thread = std::thread([this, resolve_host] {
+                struct addrinfo hints{};
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_STREAM;
+                struct addrinfo *result = nullptr;
+                uint32_t ip = 0;
+                if (getaddrinfo(resolve_host.c_str(), nullptr, &hints, &result) == 0 && result != nullptr) {
+                    auto *ipv4 = reinterpret_cast<sockaddr_in *>(result->ai_addr);
+                    ip = ipv4->sin_addr.s_addr; // network byte order
+                }
+                if (result) freeaddrinfo(result);
+                std::lock_guard<std::recursive_mutex> lock(mutex);
+                if (ip != 0 && resolve_host == host) {
+                    resolved_ip = ip;
+                    resolved_host = resolve_host;
+                    resolved_at = std::chrono::steady_clock::now();
+                }
+                dns_resolving.store(false);
+            });
+            if (resolved_ip == 0 || host != resolved_host) {
+                PRINT_DEBUG("ws resolve pending host='%s'", host.c_str());
+                close_socket();
+                return;
+            }
+        } else {
+            if (resolved_ip == 0 || host != resolved_host) {
+                return; // resolver in flight, retry next tick
+            }
+            addr.sin_addr.s_addr = resolved_ip;
         }
-        auto *ipv4 = reinterpret_cast<sockaddr_in *>(result->ai_addr);
-        resolved_ip = ipv4->sin_addr.s_addr; // network byte order
-        resolved_host = host;
-        freeaddrinfo(result);
+    } else {
+        addr.sin_addr.s_addr = resolved_ip;
     }
-    addr.sin_addr.s_addr = resolved_ip;
 
     connect_started = std::chrono::steady_clock::now();
     int res = ::connect(sock, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
@@ -522,12 +563,36 @@ void WS_Client::queue_frame_locked(uint8_t opcode, const std::vector<char> &payl
     queue_raw_locked(frame);
 }
 
+void WS_Client::send_consume_locked(size_t n)
+{
+    send_head += n;
+    if (send_head >= send_buffer.size()) {
+        send_buffer.clear();
+        send_head = 0;
+    } else if (send_head >= 65536) {
+        send_buffer.erase(send_buffer.begin(), send_buffer.begin() + static_cast<std::ptrdiff_t>(send_head));
+        send_head = 0;
+    }
+}
+
+void WS_Client::recv_consume_locked(size_t n)
+{
+    recv_head += n;
+    if (recv_head >= recv_buffer.size()) {
+        recv_buffer.clear();
+        recv_head = 0;
+    } else if (recv_head >= 65536) {
+        recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + static_cast<std::ptrdiff_t>(recv_head));
+        recv_head = 0;
+    }
+}
+
 void WS_Client::pump_write_locked()
 {
-    if (send_buffer.empty() || !socket_valid()) return;
-    int sent = ::send(sock, send_buffer.data(), static_cast<int>(send_buffer.size()), 0);
+    if (send_size_locked() == 0 || !socket_valid()) return;
+    int sent = ::send(sock, send_data_locked(), static_cast<int>(send_size_locked()), 0);
     if (sent > 0) {
-        send_buffer.erase(send_buffer.begin(), send_buffer.begin() + sent);
+        send_consume_locked(static_cast<size_t>(sent));
         return;
     }
     if (sent < 0 && !ws_last_error_is_would_block()) {
@@ -539,17 +604,20 @@ void WS_Client::pump_write_locked()
 void WS_Client::process_handshake_locked()
 {
     // wait for the full header block
-    auto header_end = std::search(recv_buffer.begin(), recv_buffer.end(), "\r\n\r\n", "\r\n\r\n" + 4);
-    if (header_end == recv_buffer.end()) {
-        if (recv_buffer.size() > 8192) {
+    const char *base = recv_data_locked();
+    size_t avail = recv_size_locked();
+    const char *found = std::search(base, base + avail, "\r\n\r\n", "\r\n\r\n" + 4);
+    if (found == base + avail) {
+        if (avail > 8192) {
             PRINT_DEBUG("ws handshake response too large");
             close_locked();
         }
         return;
     }
 
-    std::string header_block(recv_buffer.begin(), header_end + 4);
-    recv_buffer.erase(recv_buffer.begin(), header_end + 4);
+    size_t header_len = static_cast<size_t>(found - base) + 4;
+    std::string header_block(base, header_len);
+    recv_consume_locked(header_len);
 
     // status line
     size_t line_end = header_block.find("\r\n");
@@ -575,7 +643,7 @@ void WS_Client::process_handshake_locked()
     if (state_cb) state_cb(true);
 
     // any bytes after the header are the first frames
-    if (!recv_buffer.empty()) pump_read_locked();
+    if (recv_size_locked() > 0) pump_read_locked();
 }
 
 void WS_Client::pump_read_locked()
@@ -610,41 +678,45 @@ void WS_Client::pump_read_locked()
             // bit (0x80) clear, while every frame the reference server sends
             // (text/pong/close) has it set, so drop raw bytes until the next
             // real frame instead of misparsing them and closing the session.
-            while (!recv_buffer.empty() && (static_cast<uint8_t>(recv_buffer[0]) & 0x80) == 0) {
-                PRINT_DEBUG("ws resync: dropping non-frame byte 0x%02X", static_cast<uint8_t>(recv_buffer[0]));
-                recv_buffer.erase(recv_buffer.begin());
+            while (recv_size_locked() > 0 && (static_cast<uint8_t>(*recv_data_locked()) & 0x80) == 0) {
+                PRINT_TRACE("ws resync: dropping non-frame byte 0x%02X", static_cast<uint8_t>(*recv_data_locked()));
+                recv_consume_locked(1);
             }
-            if (recv_buffer.size() < 2) break;
-            uint8_t b0 = static_cast<uint8_t>(recv_buffer[0]);
-            uint8_t b1 = static_cast<uint8_t>(recv_buffer[1]);
+            if (recv_size_locked() < 2) break;
+            const char *hdr = recv_data_locked();
+            uint8_t b0 = static_cast<uint8_t>(hdr[0]);
+            uint8_t b1 = static_cast<uint8_t>(hdr[1]);
             frame_fin = (b0 & 0x80) != 0;
             frame_opcode = b0 & 0x0F;
             frame_masked = (b1 & 0x80) != 0;
             uint64_t len = b1 & 0x7F;
             size_t header_len = 2;
             if (len == 126) {
-                if (recv_buffer.size() < 4) break;
-                len = (static_cast<uint64_t>(static_cast<uint8_t>(recv_buffer[2])) << 8) | static_cast<uint8_t>(recv_buffer[3]);
+                if (recv_size_locked() < 4) break;
+                len = (static_cast<uint64_t>(static_cast<uint8_t>(hdr[2])) << 8) | static_cast<uint8_t>(hdr[3]);
                 header_len = 4;
             } else if (len == 127) {
-                if (recv_buffer.size() < 10) break;
+                if (recv_size_locked() < 10) break;
                 len = 0;
                 for (int i = 0; i < 8; ++i) {
-                    len = (len << 8) | static_cast<uint8_t>(recv_buffer[2 + i]);
+                    len = (len << 8) | static_cast<uint8_t>(hdr[2 + i]);
                 }
                 header_len = 10;
             }
             if (frame_masked) {
-                if (recv_buffer.size() < header_len + 4) break;
-                std::memcpy(frame_mask_key, recv_buffer.data() + header_len, 4);
+                if (recv_size_locked() < header_len + 4) break;
+                std::memcpy(frame_mask_key, hdr + header_len, 4);
                 header_len += 4;
             }
             if (len > WS_MAX_FRAME_SIZE) {
-                PRINT_DEBUG("ws frame too large len=%llu", static_cast<unsigned long long>(len));
+                // Safety bound mirroring the signaling server cap
+                // (ice-stack/signaling.go, 1<<20); signaling JSON is ~200B,
+                // the cap is not a tuning knob. Kept close-on-exceed.
+                PRINT_TRACE("ws frame too large len=%llu", static_cast<unsigned long long>(len));
                 close_locked();
                 return;
             }
-            recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + header_len);
+            recv_consume_locked(header_len);
             frame_expected = len;
             frame_received = 0;
             frame_payload.clear();
@@ -654,18 +726,18 @@ void WS_Client::pump_read_locked()
 
         if (frame_received < frame_expected) {
             size_t want = static_cast<size_t>(frame_expected - frame_received);
-            if (recv_buffer.size() < want) want = recv_buffer.size();
+            if (recv_size_locked() < want) want = recv_size_locked();
             if (want == 0) break;
             size_t base = frame_payload.size();
             frame_payload.resize(base + want);
-            std::memcpy(frame_payload.data() + base, recv_buffer.data(), want);
+            std::memcpy(frame_payload.data() + base, recv_data_locked(), want);
             if (frame_masked) {
                 for (size_t i = 0; i < want; ++i) {
                     frame_payload[base + i] ^= frame_mask_key[(frame_received + i) % 4];
                 }
             }
             frame_received += want;
-            recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + want);
+            recv_consume_locked(want);
             if (frame_received < frame_expected) break;
         }
 
@@ -699,8 +771,10 @@ void WS_Client::handle_frame_locked(uint8_t opcode, const std::vector<char> &pay
             std::string msg(payload.begin(), payload.end());
             if (message_cb) message_cb(std::move(msg));
         } else {
+            // Fragmented reassembly bound (WS_MAX_MESSAGE_ACCUM = 4 MiB);
+            // kept as-is, covers fragmented frames.
             if (payload.size() > WS_MAX_MESSAGE_ACCUM) {
-                PRINT_DEBUG("ws fragmented message too large");
+                PRINT_TRACE("ws fragmented message too large");
                 close_locked();
                 return;
             }
@@ -709,12 +783,12 @@ void WS_Client::handle_frame_locked(uint8_t opcode, const std::vector<char> &pay
         break;
     case 0x0: // continuation
         if (message_accum.empty()) {
-            PRINT_DEBUG("ws unexpected continuation frame");
+            PRINT_TRACE("ws unexpected continuation frame");
             close_locked();
             return;
         }
         if (message_accum.size() + payload.size() > WS_MAX_MESSAGE_ACCUM) {
-            PRINT_DEBUG("ws fragmented message too large");
+            PRINT_TRACE("ws fragmented message too large");
             close_locked();
             return;
         }
@@ -739,7 +813,7 @@ void WS_Client::handle_frame_locked(uint8_t opcode, const std::vector<char> &pay
         // Not a frame we understand (e.g. residual garbage from an unframed
         // server message that slipped past the resync). Drop it and keep the
         // connection alive instead of tearing the session down.
-        PRINT_DEBUG("ws unknown opcode %u, dropping frame", opcode);
+        PRINT_TRACE("ws unknown opcode %u, dropping frame", opcode);
         break;
     }
 }
@@ -780,7 +854,7 @@ void WS_Client::Run()
     if (state == State::Handshaking) {
         pump_write_locked();
         if (!socket_valid()) return;
-        if (!send_buffer.empty()) return; // still writing the request
+        if (send_size_locked() > 0) return; // still writing the request
         // read the server's 101 response into recv_buffer; the frame-parsing
         // part of pump_read_locked is gated on state == Open, so this only
         // accumulates bytes for process_handshake_locked() below

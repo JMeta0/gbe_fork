@@ -726,6 +726,23 @@ filter { 'files:proto_gen/** or libs/** or build/deps/** or third-party/libjuice
 filter {} -- reset the filter and remove all active keywords
 
 
+-- P1-C: release speed opts for the hot transport path only (ICE datagram
+-- protocol, WS signaling framing, sockets dispatch, protobuf wire). Scoped
+-- per-file so game/UI code keeps the generic /O2. NDEBUG/EMU_RELEASE_BUILD
+-- (set above) still strips PRINT_DEBUG/TRACE in release.
+filter { "configurations:*release", "files:dll/ice_transport.cpp or dll/ws_client.cpp or dll/network.cpp or dll/steam_networking_sockets.cpp or proto_gen/** or third-party/libjuice/**" }
+    optimize "Speed"
+filter { "configurations:*release", "action:vs*", "files:dll/ice_transport.cpp or dll/ws_client.cpp or dll/network.cpp or dll/steam_networking_sockets.cpp or proto_gen/** or third-party/libjuice/**" }
+    buildoptions {
+        "/Ot", "/Oy",
+    }
+filter { "configurations:*release", "action:gmake*", "files:dll/ice_transport.cpp or dll/ws_client.cpp or dll/network.cpp or dll/steam_networking_sockets.cpp or proto_gen/** or third-party/libjuice/**" }
+    buildoptions {
+        "-fomit-frame-pointer", "-ffast-math",
+    }
+filter {} -- reset the filter and remove all active keywords
+
+
 
 -- post build change DOS stub + sign
 ---------
@@ -1723,6 +1740,39 @@ project "test_gamepad_linux"
         '%[%{!cfg.buildtarget.abspath}]',
     }
 -- End test_gamepad_linux
+
+
+-- Project test_ice_ping (source only — added for the networking plan P0..P2)
+-- Loopback bench for the ICE reliability layer: P50/P99 RTT, retry count,
+-- loss/reorder fuzz, msg/s. Gates: P99 < 50ms direct, < 150ms TURN.
+-- Wired here so the user can build it manually on the build machine; the
+-- implementer must NOT run premake or any compiler in this change set.
+project "test_ice_ping"
+    kind "ConsoleApp"
+    location "%{wks.location}/%{prj.name}"
+    targetdir(path.join(build_dir, os_iden, _ACTION, "%{cfg.buildcfg}/tests/ice_ping"))
+    targetname "test_ice_ping_%{cfg.platform}"
+
+
+    -- common source & header files
+    ---------
+    filter {} -- reset the filter and remove all active keywords
+    files {
+        'tests/ice_ping/test_ice_ping.cpp',
+    }
+    removefiles {
+        'post_build/**',
+        'build/deps/**',
+    }
+
+
+    -- post build
+    ---------
+    filter {} -- reset the filter and remove all active keywords
+    postbuildcommands {
+        '%[%{!cfg.buildtarget.abspath}]',
+    }
+-- End test_ice_ping
 
 end
 -- End LINUX ONLY TARGETS

@@ -27,8 +27,16 @@ static uint32_t upper_range_ips[MAX_BROADCASTS];
 
 #define BROADCAST_INTERVAL 5.0
 #define ICE_REDISCOVERY_INTERVAL 1.0
-#define HEARTBEAT_TIMEOUT 20.0
-#define USER_TIMEOUT 20.0
+// P2-E: idle backoff knobs. Active peers broadcast at BROADCAST_INTERVAL;
+// when no peer has been seen for IDLE_PEER_TIMEOUT, the announce cadence
+// relaxes to IDLE_BROADCAST_INTERVAL (push on peer_connected still fires
+// immediately via trigger_ice_rediscovery).
+#define IDLE_PEER_TIMEOUT 30.0
+#define IDLE_BROADCAST_INTERVAL 20.0
+// Legacy TCP/UDP path timeouts (P0-B): heartbeat/user presence now tight
+// (was 20s/20s). ICE path liveness is ICE_DISCONNECT_GRACE_SEC (8s).
+#define HEARTBEAT_TIMEOUT 8.0
+#define USER_TIMEOUT 10.0
 
 #define MAX_UDP_SIZE 16384
 
@@ -254,7 +262,7 @@ static void reset_last_error()
 
 static int send_packet_to(sock_t sock, IP_PORT ip_port, char *data, unsigned long length)
 {
-    PRINT_DEBUG("send: %lu %hhu.%hhu.%hhu.%hhu:%hu", length, ((unsigned char *)&ip_port.ip)[0], ((unsigned char *)&ip_port.ip)[1], ((unsigned char *)&ip_port.ip)[2], ((unsigned char *)&ip_port.ip)[3], htons(ip_port.port));
+    PRINT_TRACE("send: %lu %hhu.%hhu.%hhu.%hhu:%hu", length, ((unsigned char *)&ip_port.ip)[0], ((unsigned char *)&ip_port.ip)[1], ((unsigned char *)&ip_port.ip)[2], ((unsigned char *)&ip_port.ip)[3], htons(ip_port.port));
     struct sockaddr_storage addr;
     struct sockaddr_in *addr4 = (struct sockaddr_in *)&addr;
 
@@ -340,6 +348,32 @@ static void buffers_set(sock_t sock)
     int n = 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&n, sizeof(n));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&n, sizeof(n));
+    // P1-D: verify the kernel honored the 1MB request (it may clamp to
+    // rmem_max/wmem_max); low-delay TOS + TCP keepalive below keep the
+    // signaling/lobby paths responsive under loss.
+    socklen_t optlen = sizeof(n);
+    int got = 0;
+    if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&got, &optlen) == 0 && got < n) {
+        PRINT_DEBUG("SO_RCVBUF clamped to %d (requested %d)", got, n);
+    }
+    optlen = sizeof(n);
+    got = 0;
+    if (getsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&got, &optlen) == 0 && got < n) {
+        PRINT_DEBUG("SO_SNDBUF clamped to %d (requested %d)", got, n);
+    }
+#if !defined(STEAM_WIN32)
+    int tos = 0x10; // IPTOS_LOWDELAY
+    setsockopt(sock, IPPROTO_IP, IP_TOS, (char *)&tos, sizeof(tos));
+#endif
+    int one = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char *)&one, sizeof(one));
+#if defined(TCP_KEEPIDLE) && !defined(STEAM_WIN32)
+    int idle = 10, cnt = 3, intvl = 3;
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+    (void)one;
 }
 
 static bool bind_socket(sock_t sock, uint16 port)
@@ -830,14 +864,14 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
         PRINT_DEBUG("new connection created: user %llu, appid %u", (uint64)msg->source_id(), msg->announce().appid());
     }
 
-    PRINT_DEBUG("Handle Announce: %u, " "%" PRIu64 ", %u, %u", conn->appid, msg->source_id(), msg->announce().appid(), msg->announce().type());
+    PRINT_TRACE("Handle Announce: %u, " "%" PRIu64 ", %u, %u", conn->appid, msg->source_id(), msg->announce().appid(), msg->announce().type());
     conn->tcp_ip_port = ip_port;
     conn->tcp_ip_port.port = htons(msg->announce().tcp_port());
     // A peer that reconnected announces from its current endpoint. Refresh the
     // UDP endpoint too, so we can reach it without waiting for a PONG round-trip
     // (PONG only updates it when the peer answers a PING).
     if (conn->udp_ip_port.ip != ip_port.ip || conn->udp_ip_port.port != ip_port.port) {
-        PRINT_DEBUG("updated udp endpoint from announce to %u:%u", (unsigned)ntohl(ip_port.ip), (unsigned)ntohs(ip_port.port));
+        PRINT_TRACE("updated udp endpoint from announce to %u:%u", (unsigned)ntohl(ip_port.ip), (unsigned)ntohs(ip_port.port));
         conn->udp_ip_port = ip_port;
     }
     conn->appid = msg->announce().appid();
@@ -855,7 +889,7 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
         }
 
         Connection *conn = find_connection((uint64)msg->announce().peers(i).id(), msg->announce().peers(i).appid());
-        PRINT_DEBUG("%p %u %u " "%" PRIu64 "", conn, conn ? conn->appid : (uint32)0, msg->announce().peers(i).appid(), msg->announce().peers(i).id());
+        PRINT_TRACE("%p %u %u " "%" PRIu64 "", conn, conn ? conn->appid : (uint32)0, msg->announce().peers(i).appid(), msg->announce().peers(i).id());
         if (!conn || conn->appid != msg->announce().peers(i).appid()) {
             Common_Message msg_ = create_announce(true);
             IP_PORT ipp{};
@@ -962,6 +996,8 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
         enabled = ice_transport->enabled();
         ids.push_back(id);
         reset_last_error();
+        // Same dedicated dispatch thread for the ICE path (P0-B).
+        run_thread = std::thread(&Networking::run_proc, this);
         return;
     }
 
@@ -1051,13 +1087,38 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
     ids.push_back(id);
 
     reset_last_error();
+
+    // Dedicated 5ms dispatch thread (P0-B): inbound messages and connection
+    // state are consumed here, not only when the game ticks RunCallbacks.
+    // The Steam_Client 300ms background tick stays as a watchdog only.
+    run_thread = std::thread(&Networking::run_proc, this);
+}
+
+void Networking::run_proc()
+{
+    while (!run_stop.load()) {
+        {
+            // Callbacks dispatched by Run() (do_callbacks_message, user
+            // connect/disconnect) must run under global_mutex, like they do
+            // on the game thread and the background tick — interface callback
+            // code (e.g. the overlay) relies on it. Taking global_mutex first
+            // also keeps the lock order global_mutex -> Networking::mutex
+            // uniform across all threads.
+            std::lock_guard<std::recursive_mutex> lock(global_mutex);
+            Run();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
 }
 
 Networking::~Networking()
 {
-    // Serialize against the network thread (Run/addListenId/setAppID), which
-    // touches ice_transport while holding this mutex; the leaf lock below then
-    // waits for in-flight API-thread sends before the object is freed.
+    // Stop the dispatch thread first (it may be mid-Run holding the mutex),
+    // then serialize against API threads as before.
+    run_stop.store(true);
+    if (run_thread.joinable()) {
+        run_thread.join();
+    }
     std::lock_guard<std::recursive_mutex> lock(mutex);
 
     for (auto &c : connections) {
@@ -1085,13 +1146,13 @@ Networking::~Networking()
 Common_Message Networking::create_announce(bool request)
 {
     Announce *announce = new Announce();
-    PRINT_DEBUG("ids length %zu", ids.size());
+    PRINT_TRACE("ids length %zu", ids.size());
     if (request) {
         announce->set_type(Announce::PING);
     } else {
         announce->set_type(Announce::PONG);
         for (auto &conn: connections) {
-            PRINT_DEBUG("Connection %u %llu %u", conn.udp_pinged, conn.ids[0].ConvertToUint64(), conn.appid);
+            PRINT_TRACE("Connection %u %llu %u", conn.udp_pinged, conn.ids[0].ConvertToUint64(), conn.appid);
             if (conn.udp_pinged) {
                 Announce_Other_Peers *peer = announce->add_peers();
                 peer->set_id(conn.ids[0].ConvertToUint64());
@@ -1133,9 +1194,9 @@ void Networking::send_announce_broadcasts()
         bool sent = ice_transport->SendBroadcast(&msg);
         last_broadcast = std::chrono::high_resolution_clock::now();
         if (sent) {
-            PRINT_DEBUG("sent ice broadcasts");
+            PRINT_TRACE("sent ice broadcasts");
         } else {
-            PRINT_DEBUG("ice broadcast skipped because ice transport is not ready");
+            PRINT_TRACE("ice broadcast skipped because ice transport is not ready");
         }
         return;
     }
@@ -1155,6 +1216,21 @@ void Networking::send_announce_broadcasts()
 }
 
 void Networking::Run()
+{
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        run_locked();
+    }
+
+    // Interface callbacks are invoked OUTSIDE the network mutex (but always
+    // under global_mutex, like every other dispatch path). Interface callbacks
+    // take their own locks (overlay_mutex, ...) and API threads may hold those
+    // same locks across network->sendTo*() — dispatching under `mutex` would
+    // invert the lock order and deadlock the game thread.
+    dispatch_callbacks();
+}
+
+void Networking::run_locked()
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
@@ -1184,8 +1260,22 @@ void Networking::Run()
             own_ip = ice_transport->virtual_ip();
         }
 
-        if (check_timedout(last_broadcast, BROADCAST_INTERVAL)) {
-            send_announce_broadcasts();
+        // P2-E: jittered + idle-aware announce cadence. ±20% jitter desyncs
+        // N clients that started together; idle (no connections, no recent
+        // peer) relaxes to IDLE_BROADCAST_INTERVAL. Push on peer_connected
+        // still fires immediately via trigger_ice_rediscovery.
+        {
+            double interval = BROADCAST_INTERVAL;
+            if (connections.empty()) {
+                interval = IDLE_BROADCAST_INTERVAL;
+            }
+            // Deterministic jitter from the clock (no rng needed): ±20%.
+            auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count();
+            double jitter = 1.0 + 0.2 * (static_cast<double>(now_ns % 1000) / 1000.0 - 0.5) * 2.0;
+            if (check_timedout(last_broadcast, interval * jitter)) {
+                send_announce_broadcasts();
+            }
         }
 
         ice_dispatch_messages();
@@ -1617,13 +1707,45 @@ bool Networking::sendToAll(Common_Message *msg, bool reliable)
 
 void Networking::run_callbacks(Callback_Ids id, Common_Message *msg)
 {
-    for (auto &cb : callbacks[id].callbacks) {
-        uint64 callback_allowed_steamid = cb.steam_id.ConvertToUint64();
-        uint64 message_destination_steamid = msg->dest_id();
-        if (callback_allowed_steamid == 0 || // callback wants to receive all messages (callback for broadcast)
-            message_destination_steamid == 0 || // message was broadcasted to all (broadcast message)
-            callback_allowed_steamid == message_destination_steamid) { // callback destination is the same as the message destination
-            cb.message_callback(cb.object, msg);
+    // Called with `mutex` held (all call sites are inside run_locked()); the
+    // recursive lock below only guards hypothetical future callers. Matching
+    // is re-evaluated at dispatch time by dispatch_callbacks().
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+
+    if (callbacks[id].callbacks.empty()) return;
+
+    Queued_Callback queued{};
+    queued.id = id;
+    queued.msg = *msg;
+    callback_queue.push_back(std::move(queued));
+}
+
+void Networking::dispatch_callbacks()
+{
+    // One dispatcher at a time, and the swap happens while the dispatch lock
+    // is held: whichever thread enqueued first (under `mutex`) also dispatches
+    // first, preserving cross-thread message order.
+    std::lock_guard<std::mutex> dispatch_lock(callback_dispatch_mutex);
+
+    std::vector<Queued_Callback> local;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        if (callback_queue.empty()) return;
+        local.swap(callback_queue);
+    }
+
+    // Called after `mutex` is released. Registration/unregistration
+    // (setCallback/rmCallback) happens under global_mutex, and every dispatch
+    // caller holds global_mutex, so reading `callbacks` here is safe.
+    for (auto &queued : local) {
+        for (auto &cb : callbacks[queued.id].callbacks) {
+            uint64 callback_allowed_steamid = cb.steam_id.ConvertToUint64();
+            uint64 message_destination_steamid = queued.msg.dest_id();
+            if (callback_allowed_steamid == 0 || // callback wants to receive all messages (callback for broadcast)
+                message_destination_steamid == 0 || // message was broadcasted to all (broadcast message)
+                callback_allowed_steamid == message_destination_steamid) { // callback destination is the same as the message destination
+                cb.message_callback(cb.object, &queued.msg);
+            }
         }
     }
 }

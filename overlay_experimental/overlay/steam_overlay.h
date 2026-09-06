@@ -151,6 +151,9 @@ class Steam_Overlay
     char username_text[256]{};
     std::atomic<bool> save_settings = false;
 
+    bool disable_achievement_notification = false;
+    bool disable_friend_notification = false;
+
     int current_language = 0;
 
     std::string warning_message{};

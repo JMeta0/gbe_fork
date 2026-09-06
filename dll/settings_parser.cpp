@@ -81,7 +81,8 @@ static void save_global_ini_value(class Local_Storage *local_storage, const char
     break;
     
     case IniValue::Type::BOOL:
-        new_ini.SetBoolValue(section, key, val.val_bool, comment);
+        // write bools as 1/0 to match the documented ini examples
+        new_ini.SetValue(section, key, val.val_bool ? "1" : "0", comment);
     break;
 
     case IniValue::Type::DOUBLE:

@@ -2289,7 +2289,8 @@ uint32 create_localstorage_settings(Settings **settings_client_out, Settings **s
     return appid;
 }
 
-void save_global_settings(class Local_Storage *local_storage, const char *name, const char *language)
+void save_global_settings(class Local_Storage *local_storage, const char *name, const char *language,
+    bool disable_achievement_notification, bool disable_friend_notification)
 {
     save_global_ini_value(
         local_storage,
@@ -2303,6 +2304,20 @@ void save_global_settings(class Local_Storage *local_storage, const char *name, 
         config_ini_user,
         "user::general", "language", IniValue(language),
         "the language reported to the game, default is 'english', check 'API language code' in https://partner.steamgames.com/doc/store/localization/languages"
+    );
+
+    save_global_ini_value(
+        local_storage,
+        config_ini_overlay,
+        "overlay::general", "disable_achievement_notification", IniValue(disable_achievement_notification),
+        "disable the achievements notifications"
+    );
+
+    save_global_ini_value(
+        local_storage,
+        config_ini_overlay,
+        "overlay::general", "disable_friend_notification", IniValue(disable_friend_notification),
+        "disable friends invitations and messages notifications"
     );
 }
 

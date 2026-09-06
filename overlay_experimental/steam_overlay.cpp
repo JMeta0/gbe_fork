@@ -243,6 +243,8 @@ Steam_Overlay::Steam_Overlay(Settings* settings, Local_Storage *local_storage, S
     parse_key_combo();
     parse_screenshot_key_combo();
     strncpy(username_text, settings->get_local_name(), sizeof(username_text) - 1);
+    disable_achievement_notification = settings->disable_overlay_achievement_notification;
+    disable_friend_notification = settings->disable_overlay_friend_notification;
 
     // we need these copies to show the warning only once, then disable the flag
     // avoid manipulating settings->xxx
@@ -435,6 +437,8 @@ void Steam_Overlay::create_fonts()
         font_builder.AddText(translationSelectedLanguage[i]);
         font_builder.AddText(translationRestartTheGameToApply[i]);
         font_builder.AddText(translationSave[i]);
+        font_builder.AddText(translationDisableAchievementNotification[i]);
+        font_builder.AddText(translationDisableFriendNotification[i]);
         font_builder.AddText(translationWarning[i]);
         font_builder.AddText(translationWarningDescription_badAppid[i]);
         font_builder.AddText(translationWarningDescription_localSave[i]);
@@ -2394,6 +2398,11 @@ void Steam_Overlay::render_main_window()
 
                 ImGui::Separator();
 
+                ImGui::Checkbox(translationDisableAchievementNotification[current_language], &disable_achievement_notification);
+                ImGui::Checkbox(translationDisableFriendNotification[current_language], &disable_friend_notification);
+
+                ImGui::Separator();
+
                 ImGui::Text("%s", translationRestartTheGameToApply[current_language]);
                 if (ImGui::Button(translationSave[current_language])) {
                     save_settings = true;
@@ -2960,11 +2969,16 @@ void Steam_Overlay::steam_run_callback()
         save_settings = false;
 
         const char *language_text = valid_languages[current_language];
-        save_global_settings(get_steam_client()->local_storage, username_text, language_text);
+        save_global_settings(get_steam_client()->local_storage, username_text, language_text,
+            disable_achievement_notification, disable_friend_notification);
         get_steam_client()->settings_client->set_local_name(username_text);
         get_steam_client()->settings_server->set_local_name(username_text);
         get_steam_client()->settings_client->set_language(language_text);
         get_steam_client()->settings_server->set_language(language_text);
+        get_steam_client()->settings_client->disable_overlay_achievement_notification = disable_achievement_notification;
+        get_steam_client()->settings_server->disable_overlay_achievement_notification = disable_achievement_notification;
+        get_steam_client()->settings_client->disable_overlay_friend_notification = disable_friend_notification;
+        get_steam_client()->settings_server->disable_overlay_friend_notification = disable_friend_notification;
         steamFriends->resend_friend_data();
     }
 

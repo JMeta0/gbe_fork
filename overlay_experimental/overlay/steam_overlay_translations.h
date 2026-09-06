@@ -7985,11 +7985,203 @@ const char translationConnTurn[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFF
 	// 28 - Vietnamese
   u8"TURN",
 
-	// 29 - Croatian
+  // 29 - Croatian
   u8"TURN",
   
   // 30 - Indonesian
   u8"TURN",
+  
+};
+
+const char translationDisableAchievementNotification[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFFER_SIZE] = {
+	// 0 - English
+  u8"Disable achievement notifications",
+
+	// 1 - Arabic
+  u8"Disable achievement notifications",
+
+	// 2 - Bulgarian
+  u8"Disable achievement notifications",
+
+	// 3 - Simplified Chinese
+  u8"禁用成就通知",
+
+	// 4 - Traditional Chinese
+  u8"停用成就通知",
+
+	// 5 - Czech
+  u8"Zakázat oznámení o úspěších",
+
+	// 6 - Danish
+  u8"Disable achievement notifications",
+
+	// 7 - Dutch
+  u8"Disable achievement notifications",
+
+	// 8 - Finnish
+  u8"Disable achievement notifications",
+
+	// 9 - French
+  u8"Désactiver les notifications de succès",
+
+	// 10 - German
+  u8"Erfolgsbenachrichtigungen deaktivieren",
+
+	// 11 - Greek
+  u8"Disable achievement notifications",
+
+	// 12 - Hungarian
+  u8"Disable achievement notifications",
+
+	// 13 - Italian
+  u8"Disattiva le notifiche dei successi",
+
+	// 14 - Japanese
+  u8"実績通知を無効にする",
+
+	// 15 - Korean
+  u8"업적 알림 비활성화",
+
+	// 16 - Norwegian
+  u8"Disable achievement notifications",
+
+	// 17 - Polish
+  u8"Wyłącz powiadomienia o osiągnięciach",
+
+	// 18 - Portuguese
+  u8"Desativar notificações de conquistas",
+
+	// 19 - Brazilian Portuguese
+  u8"Desativar notificações de conquistas",
+
+	// 20 - Romanian
+  u8"Disable achievement notifications",
+
+	// 21 - Russian
+  u8"Отключить уведомления о достижениях",
+
+	// 22 - Spanish
+  u8"Desactivar notificaciones de logros",
+
+	// 23 - Latin American
+  u8"Desactivar notificaciones de logros",
+
+	// 24 - Swedish
+  u8"Disable achievement notifications",
+
+	// 25 - Thai
+  u8"Disable achievement notifications",
+
+	// 26 - Turkish
+  u8"Başarı bildirimlerini devre dışı bırak",
+
+	// 27 - Ukrainian
+  u8"Вимкнути повідомлення про досягнення",
+
+	// 28 - Vietnamese
+  u8"Disable achievement notifications",
+
+	// 29 - Croatian
+  u8"Onemogući obavijesti o postignućima",
+  
+  // 30 - Indonesian
+  u8"Disable achievement notifications",
+  
+};
+
+const char translationDisableFriendNotification[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFFER_SIZE] = {
+	// 0 - English
+  u8"Disable friend notifications",
+
+	// 1 - Arabic
+  u8"Disable friend notifications",
+
+	// 2 - Bulgarian
+  u8"Disable friend notifications",
+
+	// 3 - Simplified Chinese
+  u8"禁用好友通知",
+
+	// 4 - Traditional Chinese
+  u8"停用好友通知",
+
+	// 5 - Czech
+  u8"Zakázat oznámení od přátel",
+
+	// 6 - Danish
+  u8"Disable friend notifications",
+
+	// 7 - Dutch
+  u8"Disable friend notifications",
+
+	// 8 - Finnish
+  u8"Disable friend notifications",
+
+	// 9 - French
+  u8"Désactiver les notifications d'amis",
+
+	// 10 - German
+  u8"Freundschaftsbenachrichtigungen deaktivieren",
+
+	// 11 - Greek
+  u8"Disable friend notifications",
+
+	// 12 - Hungarian
+  u8"Disable friend notifications",
+
+	// 13 - Italian
+  u8"Disattiva le notifiche degli amici",
+
+	// 14 - Japanese
+  u8"フレンド通知を無効にする",
+
+	// 15 - Korean
+  u8"친구 알림 비활성화",
+
+	// 16 - Norwegian
+  u8"Disable friend notifications",
+
+	// 17 - Polish
+  u8"Wyłącz powiadomienia od znajomych",
+
+	// 18 - Portuguese
+  u8"Desativar notificações de amigos",
+
+	// 19 - Brazilian Portuguese
+  u8"Desativar notificações de amigos",
+
+	// 20 - Romanian
+  u8"Disable friend notifications",
+
+	// 21 - Russian
+  u8"Отключить уведомления от друзей",
+
+	// 22 - Spanish
+  u8"Desactivar notificaciones de amigos",
+
+	// 23 - Latin American
+  u8"Desactivar notificaciones de amigos",
+
+	// 24 - Swedish
+  u8"Disable friend notifications",
+
+	// 25 - Thai
+  u8"Disable friend notifications",
+
+	// 26 - Turkish
+  u8"Arkadaş bildirimlerini devre dışı bırak",
+
+	// 27 - Ukrainian
+  u8"Вимкнути повідомлення від друзів",
+
+	// 28 - Vietnamese
+  u8"Disable friend notifications",
+
+	// 29 - Croatian
+  u8"Onemogući obavijesti od prijatelja",
+  
+  // 30 - Indonesian
+  u8"Disable friend notifications",
   
 };
 

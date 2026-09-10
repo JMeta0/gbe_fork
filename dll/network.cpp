@@ -1104,8 +1104,18 @@ void Networking::run_proc()
             // code (e.g. the overlay) relies on it. Taking global_mutex first
             // also keeps the lock order global_mutex -> Networking::mutex
             // uniform across all threads.
-            std::lock_guard<std::recursive_mutex> lock(global_mutex);
-            Run();
+            //
+            // Acquire it NON-BLOCKING: destroy_client() holds global_mutex
+            // across ~Steam_Client and then blocks in run_thread.join().
+            // Blocking here would deadlock that join (the ICE pump thread
+            // would never be stopped and the game would hang on exit).
+            // Skipping a tick when the lock is busy is harmless: the game
+            // thread (RunCallbacks) and the 300ms background tick run the
+            // exact same dispatch under global_mutex.
+            std::unique_lock<std::recursive_mutex> lock(global_mutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                Run();
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -1546,7 +1556,7 @@ void Networking::setAppID(uint32 appid)
 
 bool Networking::sendToIPPort(Common_Message *msg, uint32 ip, uint16 port, bool reliable)
 {
-    if (ice_transport) {
+    {
         // May be called from game threads while the destructor runs on the
         // network thread; the leaf lock keeps ice_transport alive for the call.
         std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
@@ -1628,13 +1638,17 @@ bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
         conn = find_connection(dest_id, this->appid);
     }
 
-    if (!ret && ice_transport) {
+    if (!ret) {
         // Leaf lock: game threads may hold other locks (Steam_Friends'
         // global_mutex, ...) here, so this must never be the Networking mutex,
-        // which the network thread holds across callback dispatch.
+        // which the network thread holds across callback dispatch. In ICE mode
+        // this is the only transport: do not fall through to the legacy
+        // socket path (its UDP/TCP sockets are not initialized then).
         std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
         if (ice_transport) {
             ret = ice_transport->Send(msg, reliable);
+            reset_last_error();
+            return ret;
         }
     }
 
@@ -1681,6 +1695,7 @@ bool Networking::sendToAllIndividuals(Common_Message *msg, bool reliable)
 
 bool Networking::sendToAllGameservers(Common_Message *msg, bool reliable)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     for (auto &conn: connections) {
         for (auto &steam_id : conn.ids) {
             if (steam_id.BGameServerAccount()) {
@@ -1695,6 +1710,7 @@ bool Networking::sendToAllGameservers(Common_Message *msg, bool reliable)
 
 bool Networking::sendToAll(Common_Message *msg, bool reliable)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     for (auto &conn: connections) {
         for (auto &steam_id : conn.ids) {
             msg->set_dest_id(steam_id.ConvertToUint64());

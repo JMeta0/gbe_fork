@@ -106,6 +106,11 @@ public:
         // Highest ACK seen, guards the fast-retransmit path against
         // duplicate-ACK storms (only advance triggers gap resends).
         uint32 last_fast_rtx_ack = 0;
+        // Set when a received reliable message must be acknowledged. ACKs are
+        // coalesced: flush_pending_acks_locked() sends one ACK per peer after
+        // the pump drains its events (a single ACK covers every seq up to
+        // highest_remote_seq via ack_bits), instead of one packet per message.
+        bool ack_pending = false;
         std::map<uint32, ReassemblyState> reassembly{};
         std::deque<uint32> completed_messages{};
         std::set<uint32> completed_message_set{};
@@ -258,7 +263,24 @@ private:
                                 uint64 token = 0);
     bool send_fragments_locked(Peer &peer, uint64 dest_id, const std::vector<char> &payload, bool reliable);
     void send_pending_reliable_locked();
-    void handle_ice_packet_locked(Peer &peer, const std::vector<char> &packet);
+    // Parses one wire frame in place (no payload copy): `data`/`size` are the
+    // datagram bytes as received. The ACK for a reliable message is only
+    // queued once the reassembled message is safely in inbound_packets (or was
+    // already delivered), so a full queue cannot lose a message the sender
+    // already forgot.
+    void handle_ice_packet_locked(Peer &peer, const char *data, size_t size);
+    // Delivers a fully-reassembled message from peer.reassembly to
+    // inbound_packets. Returns false without erasing the assembly when the
+    // queue is full and the message is reliable (the caller retries later);
+    // unreliable overflow drops the oldest queued message instead. On success
+    // arms the coalesced ACK for reliable messages.
+    bool try_deliver_message_locked(Peer &peer, uint32 message_id, bool reliable);
+    // Retries reliable messages that were fully reassembled but could not be
+    // queued (delivery backpressure). Runs from Run() so they land as soon as
+    // the game drains inbound_packets.
+    void flush_reliable_assemblies_locked();
+    // Sends at most one coalesced ACK per peer that has ack_pending set.
+    void flush_pending_acks_locked();
     // Periodically pings connected peers (RTT) and refreshes the selected
     // candidate pair type. Runs on the pump thread inside Run().
     void update_peer_stats_locked(std::chrono::steady_clock::time_point now);

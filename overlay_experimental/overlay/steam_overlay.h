@@ -180,12 +180,6 @@ class Steam_Overlay
     std::map<uint64, FriendConnectionStats> connections_cache{};
     std::chrono::steady_clock::time_point connections_cache_updated{};
 
-    // Per-friend connection telemetry cache (ping + Direct/STUN/TURN) shown
-    // inline in the friend list. Refreshed from Networking at most once per
-    // second while the overlay is open.
-    std::map<uint64, FriendConnectionStats> connections_cache{};
-    std::chrono::steady_clock::time_point connections_cache_updated{};
-
     // Rate-limiting queue for achievement notifications
     struct ScheduledAchievement {
         Overlay_Achievement ach;

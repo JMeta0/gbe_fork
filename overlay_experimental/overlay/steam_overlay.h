@@ -169,6 +169,16 @@ class Steam_Overlay
     bool notification_history_cache_dirty = false;
     // used when the button "Invite all" is clicked
     std::atomic<bool> invite_all_friends_clicked = false;
+    // the lobby the game passed to the last OpenOverlayInvite() call
+    // (ActivateGameOverlayInviteDialog()). invite_friend() must send the invitation
+    // to this specific lobby, not the last joined one
+    std::atomic<uint64> invite_lobby_id{};
+
+    // Per-friend connection telemetry cache (ping + Direct/STUN/TURN) shown
+    // inline in the friend list. Refreshed from Networking at most once per
+    // second while the overlay is open.
+    std::map<uint64, FriendConnectionStats> connections_cache{};
+    std::chrono::steady_clock::time_point connections_cache_updated{};
 
     // Per-friend connection telemetry cache (ping + Direct/STUN/TURN) shown
     // inline in the friend list. Refreshed from Networking at most once per

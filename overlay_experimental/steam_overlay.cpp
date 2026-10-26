@@ -241,7 +241,9 @@ Steam_Overlay::Steam_Overlay(Settings* settings, Local_Storage *local_storage, S
 
     parse_key_combo();
     parse_screenshot_key_combo();
-    strncpy(username_text, settings->get_local_name(), sizeof(username_text));
+    strncpy(username_text, settings->get_local_name(), sizeof(username_text) - 1);
+    disable_achievement_notification = settings->disable_overlay_achievement_notification;
+    disable_friend_notification = settings->disable_overlay_friend_notification;
 
     // we need these copies to show the warning only once, then disable the flag
     // avoid manipulating settings->xxx
@@ -431,6 +433,8 @@ void Steam_Overlay::create_fonts()
         font_builder.AddText(translationSelectedLanguage[i]);
         font_builder.AddText(translationRestartTheGameToApply[i]);
         font_builder.AddText(translationSave[i]);
+        font_builder.AddText(translationDisableAchievementNotification[i]);
+        font_builder.AddText(translationDisableFriendNotification[i]);
         font_builder.AddText(translationWarning[i]);
         font_builder.AddText(translationWarningDescription_badAppid[i]);
         font_builder.AddText(translationWarningDescription_localSave[i]);
@@ -946,7 +950,8 @@ void Steam_Overlay::build_friend_window(Friend const& frd, friend_window_state& 
             }
         }
 
-        ImGui::InputTextMultiline("##chat_history", &state.chat_history[0], state.chat_history.length(), { -1.0f, -2.0f * ImGui::GetFontSize() }, ImGuiInputTextFlags_ReadOnly);
+        // buf_size must include the terminating NUL: std::string::data() is length()+1 bytes
+        ImGui::InputTextMultiline("##chat_history", &state.chat_history[0], state.chat_history.length() + 1, { -1.0f, -2.0f * ImGui::GetFontSize() }, ImGuiInputTextFlags_ReadOnly);
         // TODO: Fix the layout of the chat line + send button.
         // It should be like this: chat input should fill the window size minus send button size (button size is fixed)
         // |------------------------------|
@@ -2115,6 +2120,23 @@ void Steam_Overlay::render_main_window()
         ImGui::LabelText("##label", "%s", translationFriends[current_language]);
 
         if (!friends.empty()) {
+            // Refresh per-friend ping + connection type (Direct/STUN/TURN) at
+            // most once per second so the friend list shows live values without
+            // polling the network layer every frame.
+            auto now = std::chrono::steady_clock::now();
+            if (connections_cache_updated == std::chrono::steady_clock::time_point{} ||
+                now - connections_cache_updated >= std::chrono::seconds(1)) {
+                connections_cache.clear();
+                for (const auto &[frd, state] : friends) {
+                    (void)state;
+                    FriendConnectionStats stats{};
+                    if (network->GetFriendStats(CSteamID(static_cast<uint64>(frd.id())), stats)) {
+                        connections_cache[static_cast<uint64>(frd.id())] = stats;
+                    }
+                }
+                connections_cache_updated = now;
+            }
+
             if (i_have_lobby) {
                 std::string inviteAll(translationInviteAll[current_language]);
                 inviteAll.append("##PopupInviteAllFriends");
@@ -2127,7 +2149,26 @@ void Steam_Overlay::render_main_window()
                 std::for_each(friends.begin(), friends.end(), [this](std::pair<Friend const, friend_window_state> &i) {
                     ImGui::PushID(i.second.id-base_friend_window_id+base_friend_item_id);
 
-                    ImGui::Selectable(i.second.window_title.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick);
+                    // Append ping + connection type to the right of the
+                    // "name playing appid" line for friends connected over ICE.
+                    std::string label = i.second.window_title;
+                    auto cit = connections_cache.find(static_cast<uint64>(i.first.id()));
+                    if (cit != connections_cache.end() && cit->second.connected) {
+                        label += "   ";
+                        if (cit->second.rtt_ms >= 0) {
+                            label += std::to_string(cit->second.rtt_ms);
+                            label += " ms";
+                        } else {
+                            label += "- ms";
+                        }
+                        switch (cit->second.connection_type) {
+                        case 1: label += " "; label += translationConnDirect[current_language]; break;
+                        case 2: label += " "; label += translationConnStun[current_language]; break;
+                        case 3: label += " "; label += translationConnTurn[current_language]; break;
+                        default: break;
+                        }
+                    }
+                    ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick);
                     build_friend_context_menu(i.first, i.second);
                     if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(0)) {
                         i.second.window_state |= window_state_show;
@@ -2353,6 +2394,11 @@ void Steam_Overlay::render_main_window()
 
                 ImGui::Separator();
 
+                ImGui::Checkbox(translationDisableAchievementNotification[current_language], &disable_achievement_notification);
+                ImGui::Checkbox(translationDisableFriendNotification[current_language], &disable_friend_notification);
+
+                ImGui::Separator();
+
                 ImGui::Text("%s", translationRestartTheGameToApply[current_language]);
                 if (ImGui::Button(translationSave[current_language])) {
                     save_settings = true;
@@ -2373,7 +2419,7 @@ void Steam_Overlay::render_main_window()
                 ImGui::Spacing();
 
                 ImGui::PushItemWidth(ImGui::CalcTextSize(url.c_str()).x + 20);
-                ImGui::InputText("##url_copy", (char *)url.data(), url.size(), ImGuiInputTextFlags_ReadOnly);
+                ImGui::InputText("##url_copy", (char *)url.data(), url.size() + 1, ImGuiInputTextFlags_ReadOnly);
                 ImGui::PopItemWidth();
 
                 ImGui::Spacing();
@@ -2932,11 +2978,16 @@ void Steam_Overlay::steam_run_callback()
         save_settings = false;
 
         const char *language_text = valid_languages[current_language];
-        save_global_settings(get_steam_client()->local_storage, username_text, language_text);
+        save_global_settings(get_steam_client()->local_storage, username_text, language_text,
+            disable_achievement_notification, disable_friend_notification);
         get_steam_client()->settings_client->set_local_name(username_text);
         get_steam_client()->settings_server->set_local_name(username_text);
         get_steam_client()->settings_client->set_language(language_text);
         get_steam_client()->settings_server->set_language(language_text);
+        get_steam_client()->settings_client->disable_overlay_achievement_notification = disable_achievement_notification;
+        get_steam_client()->settings_server->disable_overlay_achievement_notification = disable_achievement_notification;
+        get_steam_client()->settings_client->disable_overlay_friend_notification = disable_friend_notification;
+        get_steam_client()->settings_server->disable_overlay_friend_notification = disable_friend_notification;
         steamFriends->resend_friend_data();
     }
 

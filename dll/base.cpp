@@ -445,6 +445,7 @@ static bool is_lan_ipv4(unsigned char *ip)
     if (ip[0] == 0) return true; //Current network
     if (ip[0] == 192 && (ip[1] == 18 || ip[1] == 19)) return true; //Used for benchmark testing of inter-network communications between two separate subnets.
     if (ip[0] >= 224) return true; //ip multicast (224 - 239) future use (240.0.0.0 - 255.255.255.254) broadcast (255.255.255.255)
+    if (ip[0] == 26) return true; //radmin vpn
     return false;
 }
 

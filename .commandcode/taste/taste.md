@@ -1,0 +1,5 @@
+- Prefers verbose high-frequency network/packet logs at TRACE level instead of DEBUG, with ~1s aggregated summaries to reduce log volume. Confidence: 0.9
+- Questions shrinking existing large safety caps (e.g. WS frame limits) that were big for a reason; keep them unless there is clear gain. Confidence: 0.75
+- Prefers source-only changes from agent with no builds; user builds manually, often on another machine. Confidence: 0.9
+- Wants a handoff README summarizing all changes and why they were done to make fixes easier on the build machine. Confidence: 0.85
+- Prefers plan review comments addressed in place in the same plan file with re-review before any implementation starts. Confidence: 0.8

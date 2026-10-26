@@ -19,6 +19,7 @@
 #include "dll/dll.h"
 
 #define SEND_FRIEND_RATE 4.0
+#define FRIEND_RESEND_RATE 10.0
 
 
 Friend* Steam_Friends::find_friend(CSteamID id)
@@ -152,6 +153,32 @@ void Steam_Friends::steam_friends_run_every_runcb(void *object)
 void Steam_Friends::resend_friend_data()
 {
     modified = true;
+}
+
+// Sends our own Friend message to a specific peer. Used on connect and to
+// answer incoming friend data, so the exchange converges even when only one
+// side observed the (re)connection.
+void Steam_Friends::send_friend_data(CSteamID dest)
+{
+    Common_Message msg_;
+    msg_.set_source_id(settings->get_local_steam_id().ConvertToUint64());
+    msg_.set_dest_id(dest.ConvertToUint64());
+    Friend *f = new Friend(us);
+    f->set_id(settings->get_local_steam_id().ConvertToUint64());
+    f->set_name(settings->get_local_name());
+    f->set_appid(settings->get_local_game_id().AppID());
+    f->set_lobby_id(settings->get_lobby().ConvertToUint64());
+
+    int avatar_number = GetLargeFriendAvatar(settings->get_local_steam_id());
+    auto avatar_info = settings->get_image(avatar_number);
+    if (avatar_info && avatar_info->data.size()) {
+        f->set_avatar(avatar_info->data);
+    } else {
+        f->set_avatar("");
+    }
+
+    msg_.set_allocated_friend_(f);
+    network->sendTo(&msg_, true);
 }
 
 bool Steam_Friends::ok_friend_flags(int iFriendFlags)
@@ -1445,7 +1472,15 @@ void Steam_Friends::RunCallbacks()
         resend_friend_data();
     }
 
-    if (modified) {
+    // Periodically re-broadcast our friend data so the list heals even when a
+    // one-shot exchange was lost (e.g. a peer's ICE session was not connected
+    // yet when the connect handshake ran). Cheap: ~1 small message per peer
+    // per 10s, and the send below retries until every peer ACKs.
+    if (check_timedout(last_sent_friends, FRIEND_RESEND_RATE)) {
+        resend_friend_data();
+    }
+
+    if (modified && check_timedout(last_sent_friends, SEND_FRIEND_RATE)) {
 	    PRINT_DEBUG("sending modified data");
         Common_Message msg;
         msg.set_source_id(settings->get_local_steam_id().ConvertToUint64());
@@ -1455,9 +1490,13 @@ void Steam_Friends::RunCallbacks()
         f->set_appid(settings->get_local_game_id().AppID());
         f->set_lobby_id(settings->get_lobby().ConvertToUint64());
         msg.set_allocated_friend_(f);
-        network->sendToAllIndividuals(&msg, true);
-        modified = false;
+        bool sent = network->sendToAllIndividuals(&msg, true);
         last_sent_friends = std::chrono::high_resolution_clock::now();
+        if (sent) {
+            modified = false;
+        } else {
+            PRINT_DEBUG("friend data send deferred until a peer is reachable");
+        }
     }
 }
 
@@ -1467,6 +1506,9 @@ void Steam_Friends::Callback(Common_Message *msg)
         if (msg->low_level().type() == Low_Level::DISCONNECT) {
             PRINT_DEBUG("Disconnect");
             uint64 id = msg->source_id();
+            // The one-shot answer bookkeeping must not outlive the peer;
+            // otherwise the map grows forever across many short-lived peers.
+            last_friend_data_sent.erase(id);
             auto f = std::find_if(friends.begin(), friends.end(), [&id](Friend const& item) { return item.id() == id; });
             if (friends.end() != f) {
                 persona_change((uint64)f->id(), k_EPersonaChangeStatus);
@@ -1477,25 +1519,7 @@ void Steam_Friends::Callback(Common_Message *msg)
 
         if (msg->low_level().type() == Low_Level::CONNECT) {
             PRINT_DEBUG("Connect %llu", (uint64)msg->source_id());
-            Common_Message msg_;
-            msg_.set_source_id(settings->get_local_steam_id().ConvertToUint64());
-            msg_.set_dest_id(msg->source_id());
-            Friend *f = new Friend(us);
-            f->set_id(settings->get_local_steam_id().ConvertToUint64());
-            f->set_name(settings->get_local_name());
-            f->set_appid(settings->get_local_game_id().AppID());
-            f->set_lobby_id(settings->get_lobby().ConvertToUint64());
-            
-            int avatar_number = GetLargeFriendAvatar(settings->get_local_steam_id());
-            auto avatar_info = settings->get_image(avatar_number);
-            if (avatar_info && avatar_info->data.size()) {
-                f->set_avatar(avatar_info->data);
-            } else {
-                f->set_avatar("");
-            }
-
-            msg_.set_allocated_friend_(f);
-            network->sendTo(&msg_, true);
+            send_friend_data(CSteamID((uint64)msg->source_id()));
         }
     }
 
@@ -1521,6 +1545,19 @@ void Steam_Friends::Callback(Common_Message *msg)
             }
             //TODO: callbacks?
             *f = msg->friend_();
+        }
+
+        // Answer incoming friend data once per peer so the exchange converges
+        // even when only one side observed the (re)connection. One-shot per
+        // peer: any later loss is repaired by the periodic resend in
+        // RunCallbacks(), so this never turns into a ping-pong loop.
+        uint64 source_id = msg->source_id();
+        uint64 local_id = settings->get_local_steam_id().ConvertToUint64();
+        if (msg->friend_().id() != local_id && source_id != 0 && source_id != local_id) {
+            if (last_friend_data_sent.find(source_id) == last_friend_data_sent.end()) {
+                send_friend_data(CSteamID(source_id));
+                last_friend_data_sent[source_id] = std::chrono::high_resolution_clock::now();
+            }
         }
     }
 

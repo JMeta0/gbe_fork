@@ -60,6 +60,7 @@
 #include <filesystem>
 #include <optional>
 #include <numeric>
+#include <limits>
 
 // common includes
 #include "common_helpers/common_helpers.hpp"
@@ -194,12 +195,34 @@ static inline void reset_LastError()
         PRINT_DEBUG_CLEANUP();                                                                      \
     } while (0)
 
+    // Per-packet network detail. Same sink as PRINT_DEBUG but behind its own
+    // gate so TRACE stays off by default even in debug builds. Enable by
+    // defining EMU_ENABLE_TRACE at compile time (debug only); in release
+    // (EMU_RELEASE_BUILD) both macros compile out.
+    // High-frequency network/packet logs must use PRINT_TRACE, not
+    // PRINT_DEBUG, with ~1s aggregated DEBUG rollups for "traffic flowing".
+#if !defined(EMU_RELEASE_BUILD) && defined(EMU_ENABLE_TRACE)
+    #define PRINT_TRACE(a, ...) do {                                                                \
+        dbg_logger.write("[tid %lld] %s " a, PRINT_DEBUG_TID(), EMU_FUNC_NAME, ##__VA_ARGS__);      \
+        PRINT_DEBUG_CLEANUP();                                                                      \
+    } while (0)
+#else
+    #define PRINT_TRACE(...)
+#endif
+
 #else // EMU_RELEASE_BUILD
     #define PRINT_DEBUG(...)
+    #define PRINT_TRACE(...)
 #endif // EMU_RELEASE_BUILD
 
-// function entry
-#define PRINT_DEBUG_ENTRY() PRINT_DEBUG("")
+// function entry. High-frequency per-call logging is opt-in: the 1s traffic
+// rollups and diagnostics still log, but the per-API-call noise is suppressed
+// unless EMU_ENABLE_ENTRY_LOGS is defined.
+#if !defined(EMU_RELEASE_BUILD) && defined(EMU_ENABLE_ENTRY_LOGS)
+    #define PRINT_DEBUG_ENTRY() PRINT_DEBUG("")
+#else
+    #define PRINT_DEBUG_ENTRY()
+#endif
 #define PRINT_DEBUG_TODO() PRINT_DEBUG("// TODO")
 #define PRINT_DEBUG_GNU_WIN() PRINT_DEBUG("GNU/Win")
 

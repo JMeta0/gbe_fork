@@ -19,7 +19,9 @@
 #define NETWORK_INCLUDE
 
 #include "base.h"
+#include <atomic>
 #include <curl/curl.h>
+#include <thread>
 
 #define DEFAULT_PORT 47584
 #define NUM_QUERY_PORTS 10
@@ -96,6 +98,19 @@ struct Connection {
     std::chrono::high_resolution_clock::time_point last_received{};
 };
 
+// Connection telemetry for a friend over the ICE transport, for the overlay.
+// `connection_type` mirrors Ice_Transport::PeerConnectionType:
+// 0 = Unknown, 1 = Direct (host-host), 2 = Stun (srflx, P2P via STUN),
+// 3 = Turn (relayed through the TURN server).
+struct FriendConnectionStats {
+    bool connected = false;
+    int connection_type = 0;
+    int rtt_ms = -1; // last measured round-trip in ms, -1 = no sample yet
+};
+
+class Settings;
+class Ice_Transport;
+
 class Networking
 {
     bool enabled = false;
@@ -105,20 +120,58 @@ class Networking
     uint16 udp_port{}, tcp_port{};
     uint32 own_ip{};
     std::vector<struct Connection> connections{};
+    Ice_Transport *ice_transport{};
 
     std::vector<CSteamID> ids;
     uint32 appid;
     std::chrono::high_resolution_clock::time_point last_broadcast;
+    std::chrono::high_resolution_clock::time_point last_ice_rediscovery;
+    bool ice_ready_last_run = false;
     std::vector<IP_PORT> custom_broadcasts;
 
     std::vector<struct TCP_Socket> accepted;
     std::recursive_mutex mutex;
+    // Dedicated network thread: runs Run() at NETWORK_RUN_INTERVAL_MS so
+    // inbound dispatch never depends on the game calling SteamAPI_RunCallbacks
+    // (the 300ms Steam_Client fallback stays as a watchdog only). Without
+    // this, a loading stall drops the oldest MAX_INBOUND packets.
+    std::thread run_thread{};
+    std::atomic<bool> run_stop{false};
+    void run_proc();
+    // Leaf lock guarding the ice_transport pointer + in-flight calls. API
+    // threads (which may hold other locks, e.g. the overlay's overlay_mutex,
+    // while calling sendTo/sendToIPPort) must NOT have this lock taken after
+    // `mutex` by another thread that goes on to acquire interface locks —
+    // that would invert the lock order and deadlock. This lock is only ever
+    // the last one acquired.
+    std::recursive_mutex ice_transport_mutex;
 
     struct Network_Callback_Container callbacks[CALLBACK_IDS_MAX];
     std::vector<Common_Message> local_send;
 
+    // Callback dispatch is deferred out of the network mutex (see run_locked /
+    // dispatch_callbacks): entries are collected while `mutex` is held and
+    // invoked after it is released, under global_mutex. Interface callbacks
+    // take their own locks (overlay_mutex, ...) and API threads may hold those
+    // same locks across sendTo*() calls — invoking callbacks under `mutex`
+    // would invert that order and deadlock the game thread.
+    struct Queued_Callback {
+        Callback_Ids id{};
+        Common_Message msg{};
+    };
+    std::vector<struct Queued_Callback> callback_queue;
+    // Serializes dispatch so batches are consumed in enqueue order even when
+    // two threads call Run() concurrently (game thread + network thread).
+    // Only ever taken after global_mutex, never while holding `mutex`.
+    std::mutex callback_dispatch_mutex;
+
     struct Connection *find_connection(CSteamID id, uint32 appid = 0);
     struct Connection *new_connection(CSteamID id, uint32 appid);
+    struct Connection *find_or_create_connection(CSteamID id, uint32 appid);
+    void ice_mark_peer_online(Common_Message *msg, IP_PORT ip_port);
+    void ice_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 virtual_ip, uint16 virtual_port);
+    void ice_dispatch_messages();
+    void trigger_ice_rediscovery(const char *reason);
 
     bool handle_announce(Common_Message *msg, IP_PORT ip_port);
     bool handle_low_level_udp(Common_Message *msg, IP_PORT ip_port);
@@ -129,12 +182,14 @@ class Networking
     void run_callbacks(Callback_Ids id, Common_Message *msg);
     void run_callback_user(CSteamID steam_id, bool online, uint32 appid);
     void do_callbacks_message(Common_Message *msg);
+    void run_locked();
+    void dispatch_callbacks();
 
     Common_Message create_announce(bool request);
 
 
 public:
-    Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT> *custom_broadcasts, bool disable_sockets);
+    Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT> *custom_broadcasts, bool disable_sockets, Settings *settings = nullptr);
     ~Networking();
     
     //NOTE: for all functions ips/ports are passed/returned in host byte order
@@ -167,6 +222,11 @@ public:
     uint32 getIP(CSteamID id);
     uint16 getPort(CSteamID id);
     uint32 getOwnIP();
+
+    // Fills `out` with the ICE connection telemetry (RTT + selected candidate
+    // type) for the given friend. Returns false when ICE is disabled or no
+    // session exists for this id yet; `out` is left untouched then.
+    bool GetFriendStats(CSteamID id, FriendConnectionStats &out);
 
     void startQuery(IP_PORT ip_port);
     void shutDownQuery();

@@ -17,6 +17,7 @@
 
 #include "dll/network.h"
 #include "dll/dll.h"
+#include "dll/ice_transport.h"
 
 #define MAX_BROADCASTS 16
 static int number_broadcasts = -1;
@@ -25,8 +26,17 @@ static uint32_t lower_range_ips[MAX_BROADCASTS];
 static uint32_t upper_range_ips[MAX_BROADCASTS];
 
 #define BROADCAST_INTERVAL 5.0
-#define HEARTBEAT_TIMEOUT 20.0
-#define USER_TIMEOUT 20.0
+#define ICE_REDISCOVERY_INTERVAL 1.0
+// P2-E: idle backoff knobs. Active peers broadcast at BROADCAST_INTERVAL;
+// when no peer has been seen for IDLE_PEER_TIMEOUT, the announce cadence
+// relaxes to IDLE_BROADCAST_INTERVAL (push on peer_connected still fires
+// immediately via trigger_ice_rediscovery).
+#define IDLE_PEER_TIMEOUT 30.0
+#define IDLE_BROADCAST_INTERVAL 20.0
+// Legacy TCP/UDP path timeouts (P0-B): heartbeat/user presence now tight
+// (was 20s/20s). ICE path liveness is ICE_DISCONNECT_GRACE_SEC (8s).
+#define HEARTBEAT_TIMEOUT 8.0
+#define USER_TIMEOUT 10.0
 
 #define MAX_UDP_SIZE 16384
 
@@ -252,7 +262,7 @@ static void reset_last_error()
 
 static int send_packet_to(sock_t sock, IP_PORT ip_port, char *data, unsigned long length)
 {
-    PRINT_DEBUG("send: %lu %hhu.%hhu.%hhu.%hhu:%hu", length, ((unsigned char *)&ip_port.ip)[0], ((unsigned char *)&ip_port.ip)[1], ((unsigned char *)&ip_port.ip)[2], ((unsigned char *)&ip_port.ip)[3], htons(ip_port.port));
+    PRINT_TRACE("send: %lu %hhu.%hhu.%hhu.%hhu:%hu", length, ((unsigned char *)&ip_port.ip)[0], ((unsigned char *)&ip_port.ip)[1], ((unsigned char *)&ip_port.ip)[2], ((unsigned char *)&ip_port.ip)[3], htons(ip_port.port));
     struct sockaddr_storage addr;
     struct sockaddr_in *addr4 = (struct sockaddr_in *)&addr;
 
@@ -338,6 +348,32 @@ static void buffers_set(sock_t sock)
     int n = 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&n, sizeof(n));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&n, sizeof(n));
+    // P1-D: verify the kernel honored the 1MB request (it may clamp to
+    // rmem_max/wmem_max); low-delay TOS + TCP keepalive below keep the
+    // signaling/lobby paths responsive under loss.
+    socklen_t optlen = sizeof(n);
+    int got = 0;
+    if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&got, &optlen) == 0 && got < n) {
+        PRINT_DEBUG("SO_RCVBUF clamped to %d (requested %d)", got, n);
+    }
+    optlen = sizeof(n);
+    got = 0;
+    if (getsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&got, &optlen) == 0 && got < n) {
+        PRINT_DEBUG("SO_SNDBUF clamped to %d (requested %d)", got, n);
+    }
+#if !defined(STEAM_WIN32)
+    int tos = 0x10; // IPTOS_LOWDELAY
+    setsockopt(sock, IPPROTO_IP, IP_TOS, (char *)&tos, sizeof(tos));
+#endif
+    int one = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char *)&one, sizeof(one));
+#if defined(TCP_KEEPIDLE) && !defined(STEAM_WIN32)
+    int idle = 10, cnt = 3, intvl = 3;
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+    (void)one;
 }
 
 static bool bind_socket(sock_t sock, uint16 port)
@@ -650,8 +686,177 @@ struct Connection *Networking::new_connection(CSteamID search_id, uint32 appid)
     return &(connections[connections.size() - 1]);
 }
 
+struct Connection *Networking::find_or_create_connection(CSteamID search_id, uint32 appid)
+{
+    Connection *conn = find_connection(search_id, appid);
+    if (conn && conn->appid == appid) return conn;
+    return new_connection(search_id, appid);
+}
+
+void Networking::ice_mark_peer_online(Common_Message *msg, IP_PORT ip_port)
+{
+    if (!msg || !msg->source_id()) return;
+
+    CSteamID source_id((uint64)msg->source_id());
+    if (std::find(ids.begin(), ids.end(), source_id) != ids.end()) {
+        return;
+    }
+
+    uint32 msg_appid = this->appid;
+    if (msg->has_announce() && msg->announce().appid()) {
+        msg_appid = msg->announce().appid();
+    } else if (msg->has_gameserver() && msg->gameserver().appid()) {
+        msg_appid = msg->gameserver().appid();
+    }
+
+    Connection *conn = find_or_create_connection(source_id, msg_appid);
+    if (!conn) return;
+
+    bool notify_online = !conn->connected;
+    conn->appid = msg_appid;
+    conn->last_received = std::chrono::high_resolution_clock::now();
+    conn->tcp_ip_port = ip_port;
+    conn->udp_ip_port = ip_port;
+    conn->udp_pinged = true;
+    conn->connected = true;
+
+    if (notify_online) {
+        PRINT_DEBUG("ice peer online id=%llu appid=%u", static_cast<unsigned long long>(source_id.ConvertToUint64()), msg_appid);
+        run_callback_user(source_id, true, msg_appid);
+    }
+}
+
+void Networking::ice_mark_peer_offline(const std::vector<CSteamID> &peer_ids, uint32 disconnected_ip, uint16 disconnected_port)
+{
+    if (peer_ids.empty()) return;
+
+    auto conn = std::begin(connections);
+    while (conn != std::end(connections)) {
+        bool matched = false;
+        for (const auto &peer_id : peer_ids) {
+            if (std::find(conn->ids.begin(), conn->ids.end(), peer_id) != conn->ids.end()) {
+                matched = true;
+                break;
+            }
+        }
+
+        if (!matched) {
+            ++conn;
+            continue;
+        }
+
+        if (disconnected_ip != 0 && disconnected_port != 0 &&
+            conn->tcp_ip_port.ip != 0 && conn->tcp_ip_port.port != 0) {
+            uint32 current_ip = ntohl(conn->tcp_ip_port.ip);
+            uint16 current_port = ntohs(conn->tcp_ip_port.port);
+            if (current_ip != disconnected_ip || current_port != disconnected_port) {
+                PRINT_DEBUG(
+                    "ignoring stale disconnect for ids=%zu disconnected=%u:%u current=%u:%u",
+                    peer_ids.size(),
+                    disconnected_ip,
+                    disconnected_port,
+                    current_ip,
+                    current_port);
+                ++conn;
+                continue;
+            }
+        }
+
+        if (conn->connected) {
+            for (const auto &id : conn->ids) {
+                run_callback_user(id, false, conn->appid);
+            }
+        }
+
+        kill_tcp_socket(conn->tcp_socket_incoming);
+        kill_tcp_socket(conn->tcp_socket_outgoing);
+        conn = connections.erase(conn);
+    }
+
+    trigger_ice_rediscovery("peer offline");
+}
+
+void Networking::ice_dispatch_messages()
+{
+    if (!ice_transport) return;
+
+    std::vector<CSteamID> disconnected_ids{};
+    uint32 disconnected_ip = 0;
+    uint16 disconnected_port = 0;
+    bool session_reset = false;
+    while (ice_transport->PollDisconnect(disconnected_ids, disconnected_ip, disconnected_port, session_reset)) {
+        if (session_reset) {
+            // The peer re-negotiated a fresh ICE session (e.g. it restarted the
+            // game and re-registered on signaling). The peer itself did not go
+            // away: keep the connection and the friend entry, but mark it
+            // offline so the first data packet of the new session re-fires the
+            // CONNECT callback, which re-pushes our friend data to the peer.
+            for (const auto &id : disconnected_ids) {
+                for (auto &conn : connections) {
+                    if (std::find(conn.ids.begin(), conn.ids.end(), id) != conn.ids.end()) {
+                        conn.connected = false;
+                    }
+                }
+            }
+            trigger_ice_rediscovery("peer session restarted");
+        } else {
+            ice_mark_peer_offline(disconnected_ids, disconnected_ip, disconnected_port);
+        }
+    }
+
+    Common_Message msg{};
+    IP_PORT ip_port{};
+    bool reliable = false;
+    while (ice_transport->PollPacket(&msg, &ip_port, &reliable)) {
+        if (!msg.source_id()) {
+            continue;
+        }
+
+        ice_mark_peer_online(&msg, ip_port);
+
+        if (msg.has_announce()) {
+            handle_announce(&msg, ip_port);
+        } else if (msg.has_low_level()) {
+            handle_low_level_udp(&msg, ip_port);
+        } else {
+            msg.set_source_ip(ntohl(ip_port.ip));
+            msg.set_source_port(ntohs(ip_port.port));
+            do_callbacks_message(&msg);
+        }
+    }
+}
+
+void Networking::trigger_ice_rediscovery(const char *reason)
+{
+    if (!ice_transport) return;
+
+    auto now = std::chrono::high_resolution_clock::now();
+    if (!check_timedout(last_ice_rediscovery, ICE_REDISCOVERY_INTERVAL)) {
+        return;
+    }
+
+    last_ice_rediscovery = now;
+    last_broadcast = std::chrono::high_resolution_clock::time_point{};
+    PRINT_DEBUG("ice rediscovery requested: %s", reason ? reason : "unknown");
+
+    if (ice_transport->ready()) {
+        ice_transport->request_list();
+        send_announce_broadcasts();
+    }
+}
+
 bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
 {
+    if (!msg || !msg->source_id()) {
+        return false;
+    }
+
+    CSteamID source_id((uint64)msg->source_id());
+    if (std::find(ids.begin(), ids.end(), source_id) != ids.end()) {
+        PRINT_DEBUG("ignoring self announce from %llu", (uint64)msg->source_id());
+        return true;
+    }
+
     Connection *conn = find_connection((uint64)msg->source_id(), msg->announce().appid());
     if (!conn || conn->appid != msg->announce().appid()) {
         conn = new_connection((uint64)msg->source_id(), msg->announce().appid());
@@ -659,9 +864,16 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
         PRINT_DEBUG("new connection created: user %llu, appid %u", (uint64)msg->source_id(), msg->announce().appid());
     }
 
-    PRINT_DEBUG("Handle Announce: %u, " "%" PRIu64 ", %u, %u", conn->appid, msg->source_id(), msg->announce().appid(), msg->announce().type());
+    PRINT_TRACE("Handle Announce: %u, " "%" PRIu64 ", %u, %u", conn->appid, msg->source_id(), msg->announce().appid(), msg->announce().type());
     conn->tcp_ip_port = ip_port;
     conn->tcp_ip_port.port = htons(msg->announce().tcp_port());
+    // A peer that reconnected announces from its current endpoint. Refresh the
+    // UDP endpoint too, so we can reach it without waiting for a PONG round-trip
+    // (PONG only updates it when the peer answers a PING).
+    if (conn->udp_ip_port.ip != ip_port.ip || conn->udp_ip_port.port != ip_port.port) {
+        PRINT_TRACE("updated udp endpoint from announce to %u:%u", (unsigned)ntohl(ip_port.ip), (unsigned)ntohs(ip_port.port));
+        conn->udp_ip_port = ip_port;
+    }
     conn->appid = msg->announce().appid();
 
     for (int i = 0; i < msg->announce().ids_size(); ++i) {
@@ -673,21 +885,25 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
         auto id_temp = std::find(ids.begin(), ids.end(), search_id);
         if (id_temp != ids.end()) {
             own_ip = ntohl(msg->announce().peers(i).ip());
+            continue;
         }
 
         Connection *conn = find_connection((uint64)msg->announce().peers(i).id(), msg->announce().peers(i).appid());
-        PRINT_DEBUG("%p %u %u " "%" PRIu64 "", conn, conn ? conn->appid : (uint32)0, msg->announce().peers(i).appid(), msg->announce().peers(i).id());
+        PRINT_TRACE("%p %u %u " "%" PRIu64 "", conn, conn ? conn->appid : (uint32)0, msg->announce().peers(i).appid(), msg->announce().peers(i).id());
         if (!conn || conn->appid != msg->announce().peers(i).appid()) {
             Common_Message msg_ = create_announce(true);
-
-            size_t size = msg_.ByteSizeLong();
-            char *buffer = new char[size];
-            msg_.SerializeToArray(buffer, static_cast<int>(size));
-            IP_PORT ipp;
+            IP_PORT ipp{};
             ipp.ip = msg->announce().peers(i).ip();
             ipp.port = htons(msg->announce().peers(i).udp_port());
-            send_packet_to(udp_socket, ipp, buffer, static_cast<unsigned long>(size));
-            delete[] buffer;
+            if (ice_transport) {
+                ice_transport->SendToEndpoint(&msg_, ntohl(ipp.ip), ntohs(ipp.port), false);
+            } else {
+                size_t size = msg_.ByteSizeLong();
+                char *buffer = new char[size];
+                msg_.SerializeToArray(buffer, static_cast<int>(size));
+                send_packet_to(udp_socket, ipp, buffer, static_cast<unsigned long>(size));
+                delete[] buffer;
+            }
         }
     }
 
@@ -695,20 +911,28 @@ bool Networking::handle_announce(Common_Message *msg, IP_PORT ip_port)
 
     if (msg->announce().type() == Announce::PING) {
         Common_Message msg = create_announce(false);
-        size_t size = msg.ByteSizeLong(); 
-        char *buffer = new char[size];
-        msg.SerializeToArray(buffer, static_cast<int>(size));
-        send_packet_to(udp_socket, ip_port, buffer, static_cast<unsigned long>(size));
-        delete[] buffer;
-
-        //send ping packet if not pinged
-        if (!conn->udp_pinged) {
-            Common_Message msg = create_announce(true);
+        if (ice_transport) {
+            ice_transport->SendToEndpoint(&msg, ntohl(ip_port.ip), ntohs(ip_port.port), false);
+        } else {
             size_t size = msg.ByteSizeLong(); 
             char *buffer = new char[size];
             msg.SerializeToArray(buffer, static_cast<int>(size));
             send_packet_to(udp_socket, ip_port, buffer, static_cast<unsigned long>(size));
             delete[] buffer;
+        }
+
+        //send ping packet if not pinged
+        if (!conn->udp_pinged) {
+            Common_Message msg = create_announce(true);
+            if (ice_transport) {
+                ice_transport->SendToEndpoint(&msg, ntohl(ip_port.ip), ntohs(ip_port.port), false);
+            } else {
+                size_t size = msg.ByteSizeLong();
+                char *buffer = new char[size];
+                msg.SerializeToArray(buffer, static_cast<int>(size));
+                send_packet_to(udp_socket, ip_port, buffer, static_cast<unsigned long>(size));
+                delete[] buffer;
+            }
         }
     } else if (msg->announce().type() == Announce::PONG) {
         conn->udp_ip_port = ip_port;
@@ -739,17 +963,41 @@ bool Networking::handle_low_level_udp(Common_Message *msg, IP_PORT ip_port)
 
 #define NUM_TCP_WAITING 128
 
-Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT> *custom_broadcasts, bool disable_sockets)
+Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT> *custom_broadcasts, bool disable_sockets, Settings *settings)
 {
+    query_socket = udp_socket = tcp_socket = static_cast<sock_t>(~0);
     tcp_port = udp_port = port;
     own_ip = 0x7F000001;
     last_run = std::chrono::high_resolution_clock::now();
+    last_broadcast = std::chrono::high_resolution_clock::time_point{};
+    last_ice_rediscovery = std::chrono::high_resolution_clock::time_point{};
     this->appid = appid;
 
     if (disable_sockets) {
         enabled = false;
         udp_socket = -1;
         tcp_socket = -1;
+        return;
+    }
+
+    if (settings && settings->enable_ice && !settings->signaling_host.empty() && settings->signaling_port != 0) {
+        ice_transport = new Ice_Transport(
+            settings->signaling_host, settings->signaling_port, settings->signaling_secret,
+            settings->stun_host, settings->stun_port,
+            settings->turn_host, settings->turn_port, settings->turn_user, settings->turn_pass,
+            port, appid, id);
+
+        if (curl_global_init(CURL_GLOBAL_ALL) == 0) {
+            PRINT_DEBUG("CURL successful");
+        } else {
+            PRINT_DEBUG("CURL: could not initialize");
+        }
+
+        enabled = ice_transport->enabled();
+        ids.push_back(id);
+        reset_last_error();
+        // Same dedicated dispatch thread for the ICE path (P0-B).
+        run_thread = std::thread(&Networking::run_proc, this);
         return;
     }
 
@@ -839,10 +1087,50 @@ Networking::Networking(CSteamID id, uint32 appid, uint16 port, std::set<IP_PORT>
     ids.push_back(id);
 
     reset_last_error();
+
+    // Dedicated 5ms dispatch thread (P0-B): inbound messages and connection
+    // state are consumed here, not only when the game ticks RunCallbacks.
+    // The Steam_Client 300ms background tick stays as a watchdog only.
+    run_thread = std::thread(&Networking::run_proc, this);
+}
+
+void Networking::run_proc()
+{
+    while (!run_stop.load()) {
+        {
+            // Callbacks dispatched by Run() (do_callbacks_message, user
+            // connect/disconnect) must run under global_mutex, like they do
+            // on the game thread and the background tick — interface callback
+            // code (e.g. the overlay) relies on it. Taking global_mutex first
+            // also keeps the lock order global_mutex -> Networking::mutex
+            // uniform across all threads.
+            //
+            // Acquire it NON-BLOCKING: destroy_client() holds global_mutex
+            // across ~Steam_Client and then blocks in run_thread.join().
+            // Blocking here would deadlock that join (the ICE pump thread
+            // would never be stopped and the game would hang on exit).
+            // Skipping a tick when the lock is busy is harmless: the game
+            // thread (RunCallbacks) and the 300ms background tick run the
+            // exact same dispatch under global_mutex.
+            std::unique_lock<std::recursive_mutex> lock(global_mutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                Run();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
 }
 
 Networking::~Networking()
 {
+    // Stop the dispatch thread first (it may be mid-Run holding the mutex),
+    // then serialize against API threads as before.
+    run_stop.store(true);
+    if (run_thread.joinable()) {
+        run_thread.join();
+    }
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+
     for (auto &c : connections) {
         kill_tcp_socket(c.tcp_socket_incoming);
         kill_tcp_socket(c.tcp_socket_outgoing);
@@ -854,6 +1142,13 @@ Networking::~Networking()
 
     kill_socket(udp_socket);
     kill_socket(tcp_socket);
+    {
+        // Leaf lock: an API thread may be inside ice_transport->Send() right
+        // now (holding this same lock); wait for it before freeing the object.
+        std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+        delete ice_transport;
+        ice_transport = nullptr;
+    }
 
     curl_global_cleanup();
 }
@@ -861,13 +1156,13 @@ Networking::~Networking()
 Common_Message Networking::create_announce(bool request)
 {
     Announce *announce = new Announce();
-    PRINT_DEBUG("ids length %zu", ids.size());
+    PRINT_TRACE("ids length %zu", ids.size());
     if (request) {
         announce->set_type(Announce::PING);
     } else {
         announce->set_type(Announce::PONG);
         for (auto &conn: connections) {
-            PRINT_DEBUG("Connection %u %llu %u", conn.udp_pinged, conn.ids[0].ConvertToUint64(), conn.appid);
+            PRINT_TRACE("Connection %u %llu %u", conn.udp_pinged, conn.ids[0].ConvertToUint64(), conn.appid);
             if (conn.udp_pinged) {
                 Announce_Other_Peers *peer = announce->add_peers();
                 peer->set_id(conn.ids[0].ConvertToUint64());
@@ -878,18 +1173,43 @@ Common_Message Networking::create_announce(bool request)
         }
     }
 
-    announce->set_tcp_port(tcp_port);
+    announce->set_tcp_port(ice_transport && ice_transport->ready() ? ice_transport->virtual_port() : tcp_port);
     announce->set_appid(this->appid);
     for (auto &id : ids) announce->add_ids(id.ConvertToUint64());
     Common_Message msg;
     msg.set_allocated_announce(announce);
-    msg.set_source_id(ids[0].ConvertToUint64());
+
+    // Announce as the per-player individual account id when one is present
+    // (falls back to ids[0] for game servers / single-id setups). The old
+    // behavior announced as the game-server id, which every client sharing the
+    // same config also has: the receiver's "ignoring self announce" check then
+    // dropped the announce and the friend list never lit up for two clients
+    // using the same config (e.g. sandboxed multi-instance testing).
+    uint64 announce_source_id = ids.empty() ? 0 : ids[0].ConvertToUint64();
+    for (const auto &id : ids) {
+        if (id.BIndividualAccount()) {
+            announce_source_id = id.ConvertToUint64();
+            break;
+        }
+    }
+    msg.set_source_id(announce_source_id);
     return msg;
 }
 
 void Networking::send_announce_broadcasts()
 {
     Common_Message msg = create_announce(true);
+
+    if (ice_transport) {
+        bool sent = ice_transport->SendBroadcast(&msg);
+        last_broadcast = std::chrono::high_resolution_clock::now();
+        if (sent) {
+            PRINT_TRACE("sent ice broadcasts");
+        } else {
+            PRINT_TRACE("ice broadcast skipped because ice transport is not ready");
+        }
+        return;
+    }
 
     size_t size = msg.ByteSizeLong(); 
     std::vector<char> buffer(size);
@@ -907,11 +1227,78 @@ void Networking::send_announce_broadcasts()
 
 void Networking::Run()
 {
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        run_locked();
+    }
+
+    // Interface callbacks are invoked OUTSIDE the network mutex (but always
+    // under global_mutex, like every other dispatch path). Interface callbacks
+    // take their own locks (overlay_mutex, ...) and API threads may hold those
+    // same locks across network->sendTo*() — dispatching under `mutex` would
+    // invert the lock order and deadlock the game thread.
+    dispatch_callbacks();
+}
+
+void Networking::run_locked()
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
     double time_extra = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_run).count();
     last_run = now;
 
     if (!enabled || ids.size() == 0) {
+        return;
+    }
+
+    if (ice_transport) {
+        // The ICE protocol itself runs on Ice_Transport's dedicated pump
+        // thread (ICE_PUMP_INTERVAL_MS), independent of this per-frame call.
+        // Here we only consume what the pump produced: connection state,
+        // inbound messages and disconnects.
+        bool ice_ready = ice_transport->ready();
+        if (ice_ready && !ice_ready_last_run) {
+            trigger_ice_rediscovery("ice session restored");
+        }
+        ice_ready_last_run = ice_ready;
+
+        if (ice_transport->poll_new_connection()) {
+            trigger_ice_rediscovery("ice peer connected");
+        }
+
+        if (ice_ready) {
+            own_ip = ice_transport->virtual_ip();
+        }
+
+        // P2-E: jittered + idle-aware announce cadence. ±20% jitter desyncs
+        // N clients that started together; idle (no connections, no recent
+        // peer) relaxes to IDLE_BROADCAST_INTERVAL. Push on peer_connected
+        // still fires immediately via trigger_ice_rediscovery.
+        {
+            double interval = BROADCAST_INTERVAL;
+            if (connections.empty()) {
+                interval = IDLE_BROADCAST_INTERVAL;
+            }
+            // Deterministic jitter from the clock (no rng needed): ±20%.
+            auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count();
+            double jitter = 1.0 + 0.2 * (static_cast<double>(now_ns % 1000) / 1000.0 - 0.5) * 2.0;
+            if (check_timedout(last_broadcast, interval * jitter)) {
+                send_announce_broadcasts();
+            }
+        }
+
+        ice_dispatch_messages();
+
+        std::vector<Common_Message> local_send_copy = local_send;
+        local_send.clear();
+        for (auto &m : local_send_copy) {
+            m.set_source_ip(own_ip);
+            m.set_source_port(ice_transport->ready() ? ice_transport->virtual_port() : udp_port);
+            do_callbacks_message(&m);
+        }
+
+        reset_last_error();
         return;
     }
 
@@ -1122,6 +1509,7 @@ void Networking::Run()
                 kill_tcp_socket(conn->tcp_socket_incoming);
                 conn = connections.erase(conn);
                 PRINT_DEBUG("USER TIMEOUT");
+                trigger_ice_rediscovery("peer timeout");
             } else {
                 ++conn;
             }
@@ -1132,6 +1520,7 @@ void Networking::Run()
         if (!(conn.tcp_socket_incoming.received_data || conn.tcp_socket_outgoing.received_data)) {
             if (conn.connected) for (auto &steam_id : conn.ids) run_callback_user(steam_id, false, conn.appid);
             conn.connected = false;
+            trigger_ice_rediscovery("peer disconnected");
         }
     }
 
@@ -1140,6 +1529,7 @@ void Networking::Run()
 
 void Networking::addListenId(CSteamID id)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     if (!enabled) return;
     auto i = std::find(ids.begin(), ids.end(), id);
     if (i != ids.end()) {
@@ -1148,17 +1538,33 @@ void Networking::addListenId(CSteamID id)
 
     PRINT_DEBUG("ADDED ID %llu", (uint64)id.ConvertToUint64());
     ids.push_back(id);
+    if (ice_transport) {
+        ice_transport->add_listen_id(id);
+    }
     send_announce_broadcasts();
     return;
 }
 
 void Networking::setAppID(uint32 appid)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     this->appid = appid;
+    if (ice_transport) {
+        ice_transport->set_appid(appid);
+    }
 }
 
 bool Networking::sendToIPPort(Common_Message *msg, uint32 ip, uint16 port, bool reliable)
 {
+    {
+        // May be called from game threads while the destructor runs on the
+        // network thread; the leaf lock keeps ice_transport alive for the call.
+        std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+        if (ice_transport) {
+            return ice_transport->SendToEndpoint(msg, ip, port, reliable);
+        }
+    }
+
     bool is_local_ip = ((ip >> 24) == 0x7F);
     uint32_t local_ip = getIP(ids.front());
     PRINT_DEBUG("%X %u %X", ip, is_local_ip, local_ip);
@@ -1195,6 +1601,21 @@ uint16 Networking::getPort(CSteamID id)
     return 0;
 }
 
+bool Networking::GetFriendStats(CSteamID id, FriendConnectionStats &out)
+{
+    if (!id.IsValid()) return false;
+    // Leaf lock (never `mutex`): the network thread may be inside Run() holding
+    // `mutex` while the overlay polls stats from the render thread.
+    std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+    if (!ice_transport) return false;
+    Ice_Transport::PeerStats stats{};
+    if (!ice_transport->GetPeerStats(id.ConvertToUint64(), stats)) return false;
+    out.connected = stats.connected;
+    out.connection_type = static_cast<int>(stats.connection_type);
+    out.rtt_ms = stats.rtt_ms;
+    return true;
+}
+
 bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
 {
     if (!enabled) return false;
@@ -1215,6 +1636,20 @@ bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
 
     if (!conn) {
         conn = find_connection(dest_id, this->appid);
+    }
+
+    if (!ret) {
+        // Leaf lock: game threads may hold other locks (Steam_Friends'
+        // global_mutex, ...) here, so this must never be the Networking mutex,
+        // which the network thread holds across callback dispatch. In ICE mode
+        // this is the only transport: do not fall through to the legacy
+        // socket path (its UDP/TCP sockets are not initialized then).
+        std::lock_guard<std::recursive_mutex> lock(ice_transport_mutex);
+        if (ice_transport) {
+            ret = ice_transport->Send(msg, reliable);
+            reset_last_error();
+            return ret;
+        }
     }
 
     if (!ret && conn) {
@@ -1240,20 +1675,27 @@ bool Networking::sendTo(Common_Message *msg, bool reliable, Connection *conn)
 
 bool Networking::sendToAllIndividuals(Common_Message *msg, bool reliable)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    bool sent_any = false;
+    bool all_sent = true;
     for (auto &conn: connections) {
         for (auto &steam_id : conn.ids) {
             if (steam_id.BIndividualAccount()) {
+                sent_any = true;
                 msg->set_dest_id(steam_id.ConvertToUint64());
-                sendTo(msg, reliable, &conn);
+                if (!sendTo(msg, reliable, &conn)) {
+                    all_sent = false;
+                }
             }
         }
     }
 
-    return true;
+    return sent_any && all_sent;
 }
 
 bool Networking::sendToAllGameservers(Common_Message *msg, bool reliable)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     for (auto &conn: connections) {
         for (auto &steam_id : conn.ids) {
             if (steam_id.BGameServerAccount()) {
@@ -1268,6 +1710,7 @@ bool Networking::sendToAllGameservers(Common_Message *msg, bool reliable)
 
 bool Networking::sendToAll(Common_Message *msg, bool reliable)
 {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     for (auto &conn: connections) {
         for (auto &steam_id : conn.ids) {
             msg->set_dest_id(steam_id.ConvertToUint64());
@@ -1280,13 +1723,45 @@ bool Networking::sendToAll(Common_Message *msg, bool reliable)
 
 void Networking::run_callbacks(Callback_Ids id, Common_Message *msg)
 {
-    for (auto &cb : callbacks[id].callbacks) {
-        uint64 callback_allowed_steamid = cb.steam_id.ConvertToUint64();
-        uint64 message_destination_steamid = msg->dest_id();
-        if (callback_allowed_steamid == 0 || // callback wants to receive all messages (callback for broadcast)
-            message_destination_steamid == 0 || // message was broadcasted to all (broadcast message)
-            callback_allowed_steamid == message_destination_steamid) { // callback destination is the same as the message destination
-            cb.message_callback(cb.object, msg);
+    // Called with `mutex` held (all call sites are inside run_locked()); the
+    // recursive lock below only guards hypothetical future callers. Matching
+    // is re-evaluated at dispatch time by dispatch_callbacks().
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+
+    if (callbacks[id].callbacks.empty()) return;
+
+    Queued_Callback queued{};
+    queued.id = id;
+    queued.msg = *msg;
+    callback_queue.push_back(std::move(queued));
+}
+
+void Networking::dispatch_callbacks()
+{
+    // One dispatcher at a time, and the swap happens while the dispatch lock
+    // is held: whichever thread enqueued first (under `mutex`) also dispatches
+    // first, preserving cross-thread message order.
+    std::lock_guard<std::mutex> dispatch_lock(callback_dispatch_mutex);
+
+    std::vector<Queued_Callback> local;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        if (callback_queue.empty()) return;
+        local.swap(callback_queue);
+    }
+
+    // Called after `mutex` is released. Registration/unregistration
+    // (setCallback/rmCallback) happens under global_mutex, and every dispatch
+    // caller holds global_mutex, so reading `callbacks` here is safe.
+    for (auto &queued : local) {
+        for (auto &cb : callbacks[queued.id].callbacks) {
+            uint64 callback_allowed_steamid = cb.steam_id.ConvertToUint64();
+            uint64 message_destination_steamid = queued.msg.dest_id();
+            if (callback_allowed_steamid == 0 || // callback wants to receive all messages (callback for broadcast)
+                message_destination_steamid == 0 || // message was broadcasted to all (broadcast message)
+                callback_allowed_steamid == message_destination_steamid) { // callback destination is the same as the message destination
+                cb.message_callback(cb.object, &queued.msg);
+            }
         }
     }
 }
@@ -1346,6 +1821,12 @@ uint32 Networking::getOwnIP()
 
 void Networking::startQuery(IP_PORT ip_port)
 {
+    if (ice_transport) {
+        PRINT_DEBUG("source query is unsupported in ice mode");
+        query_alive = false;
+        return;
+    }
+
     if (ip_port.port <= 1024)
         return;
 
@@ -1412,5 +1893,6 @@ void Networking::shutDownQuery()
 
 bool Networking::isQueryAlive()
 {
+    if (ice_transport) return false;
     return query_alive;
 }

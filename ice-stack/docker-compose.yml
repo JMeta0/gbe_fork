@@ -1,0 +1,53 @@
+# ICE stack for the emulator's P2P transport: WebSocket signaling +
+# coturn (STUN + TURN). See README.md in this directory for the full guide.
+#
+#   docker compose up -d --build
+#
+# Services:
+#   signaling : the emulator's WebSocket rendezvous server (ws://<host>:49100)
+#   coturn    : STUN (3478/udp) + TURN (3478/udp+tcp, relay 49160-49200/udp)
+#
+# coturn uses the host network on purpose: Docker maps large UDP port ranges
+# poorly, and host networking keeps the relayed ports directly reachable.
+
+services:
+  signaling:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "49100:49100" # WebSocket rendezvous for the emulator
+    # Shared-secret auth: clients must send this value as their emulator's
+    # "signaling_secret" config, otherwise the server answers 401. Change it
+    # and re-run `docker compose up -d --build` (no build needed for a flag
+    # change, but the image is rebuilt lazily anyway).
+    command: ["-addr", ":49100", "-secret", "change-me-signaling-secret"]
+
+  coturn:
+    image: coturn/coturn:4.17
+    network_mode: host # recommended by coturn for relay port ranges
+    restart: unless-stopped
+    environment:
+      - DETECT_EXTERNAL_IP=yes # resolves --external-ip from the host's IP
+      - DETECT_RELAY_IP=yes
+    volumes:
+      # Copy turnserver.example.conf to turnserver.conf and edit it first.
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+
+  # Alternative: ich777/stun-turn-server (coturn under the hood, env-var driven).
+  # Requires EXTRA_PARAMS to force static long-term credentials (the emulator
+  # cannot do TURN REST/HMAC auth) and PORT=3478 (the image defaults to 5349/TLS).
+  # Swap `coturn` for this service if you prefer env-var config; see
+  # README.md section "Alternative TURN images".
+  #
+  # coturn-alt:
+  #   image: ich777/stun-turn-server:latest
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   environment:
+  #     - PORT=3478                    # plain TURN/STUN port (image default is 5349/TLS)
+  #     - REALM=my-realm
+  #     - SECRET=                      # leave empty; auto-generated into secret.txt
+  #     - EXTRA_PARAMS=--lt-cred-mech --user=myuser:mypass
+  #   volumes:
+  #     - ./turn-data:/stun-turn       # config/secret persist here

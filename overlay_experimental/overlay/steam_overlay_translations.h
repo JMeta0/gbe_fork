@@ -7705,5 +7705,485 @@ const char translationPlaytimeDisplay[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATI
   
 };
 
+const char translationConnDirect[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFFER_SIZE] = {
+	// 0 - English
+  u8"Direct",
+
+	// 1 - Arabic
+  u8"مباشر",
+
+	// 2 - Bulgarian
+  u8"Директна",
+
+	// 3 - Simplified Chinese
+  u8"直接",
+
+	// 4 - Traditional Chinese
+  u8"直接",
+
+	// 5 - Czech
+  u8"Přímé",
+
+	// 6 - Danish
+  u8"Direkte",
+
+	// 7 - Dutch
+  u8"Direct",
+
+	// 8 - Finnish
+  u8"Suora",
+
+	// 9 - French
+  u8"Direct",
+
+	// 10 - German
+  u8"Direkt",
+
+	// 11 - Greek
+  u8"Άμεση",
+
+	// 12 - Hungarian
+  u8"Közvetlen",
+
+	// 13 - Italian
+  u8"Diretto",
+
+	// 14 - Japanese
+  u8"直接",
+
+	// 15 - Korean
+  u8"직접",
+
+	// 16 - Norwegian
+  u8"Direkte",
+
+	// 17 - Polish
+  u8"Bezpośrednio",
+
+	// 18 - Portuguese
+  u8"Direto",
+
+	// 19 - Brazilian Portuguese
+  u8"Direto",
+
+	// 20 - Romanian
+  u8"Direct",
+
+	// 21 - Russian
+  u8"Прямое",
+
+	// 22 - Spanish
+  u8"Directo",
+
+	// 23 - Latin American
+  u8"Directo",
+
+	// 24 - Swedish
+  u8"Direkt",
+
+	// 25 - Thai
+  u8"โดยตรง",
+
+	// 26 - Turkish
+  u8"Doğrudan",
+
+	// 27 - Ukrainian
+  u8"Пряме",
+
+	// 28 - Vietnamese
+  u8"Trực tiếp",
+
+	// 29 - Croatian
+  u8"Izravno",
+  
+  // 30 - Indonesian
+  u8"Langsung",
+  
+};
+
+const char translationConnStun[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFFER_SIZE] = {
+	// 0 - English
+  u8"STUN",
+
+	// 1 - Arabic
+  u8"STUN",
+
+	// 2 - Bulgarian
+  u8"STUN",
+
+	// 3 - Simplified Chinese
+  u8"STUN",
+
+	// 4 - Traditional Chinese
+  u8"STUN",
+
+	// 5 - Czech
+  u8"STUN",
+
+	// 6 - Danish
+  u8"STUN",
+
+	// 7 - Dutch
+  u8"STUN",
+
+	// 8 - Finnish
+  u8"STUN",
+
+	// 9 - French
+  u8"STUN",
+
+	// 10 - German
+  u8"STUN",
+
+	// 11 - Greek
+  u8"STUN",
+
+	// 12 - Hungarian
+  u8"STUN",
+
+	// 13 - Italian
+  u8"STUN",
+
+	// 14 - Japanese
+  u8"STUN",
+
+	// 15 - Korean
+  u8"STUN",
+
+	// 16 - Norwegian
+  u8"STUN",
+
+	// 17 - Polish
+  u8"STUN",
+
+	// 18 - Portuguese
+  u8"STUN",
+
+	// 19 - Brazilian Portuguese
+  u8"STUN",
+
+	// 20 - Romanian
+  u8"STUN",
+
+	// 21 - Russian
+  u8"STUN",
+
+	// 22 - Spanish
+  u8"STUN",
+
+	// 23 - Latin American
+  u8"STUN",
+
+	// 24 - Swedish
+  u8"STUN",
+
+	// 25 - Thai
+  u8"STUN",
+
+	// 26 - Turkish
+  u8"STUN",
+
+	// 27 - Ukrainian
+  u8"STUN",
+
+	// 28 - Vietnamese
+  u8"STUN",
+
+	// 29 - Croatian
+  u8"STUN",
+  
+  // 30 - Indonesian
+  u8"STUN",
+  
+};
+
+const char translationConnTurn[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFFER_SIZE] = {
+	// 0 - English
+  u8"TURN",
+
+	// 1 - Arabic
+  u8"TURN",
+
+	// 2 - Bulgarian
+  u8"TURN",
+
+	// 3 - Simplified Chinese
+  u8"TURN",
+
+	// 4 - Traditional Chinese
+  u8"TURN",
+
+	// 5 - Czech
+  u8"TURN",
+
+	// 6 - Danish
+  u8"TURN",
+
+	// 7 - Dutch
+  u8"TURN",
+
+	// 8 - Finnish
+  u8"TURN",
+
+	// 9 - French
+  u8"TURN",
+
+	// 10 - German
+  u8"TURN",
+
+	// 11 - Greek
+  u8"TURN",
+
+	// 12 - Hungarian
+  u8"TURN",
+
+	// 13 - Italian
+  u8"TURN",
+
+	// 14 - Japanese
+  u8"TURN",
+
+	// 15 - Korean
+  u8"TURN",
+
+	// 16 - Norwegian
+  u8"TURN",
+
+	// 17 - Polish
+  u8"TURN",
+
+	// 18 - Portuguese
+  u8"TURN",
+
+	// 19 - Brazilian Portuguese
+  u8"TURN",
+
+	// 20 - Romanian
+  u8"TURN",
+
+	// 21 - Russian
+  u8"TURN",
+
+	// 22 - Spanish
+  u8"TURN",
+
+	// 23 - Latin American
+  u8"TURN",
+
+	// 24 - Swedish
+  u8"TURN",
+
+	// 25 - Thai
+  u8"TURN",
+
+	// 26 - Turkish
+  u8"TURN",
+
+	// 27 - Ukrainian
+  u8"TURN",
+
+	// 28 - Vietnamese
+  u8"TURN",
+
+  // 29 - Croatian
+  u8"TURN",
+  
+  // 30 - Indonesian
+  u8"TURN",
+  
+};
+
+const char translationDisableAchievementNotification[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFFER_SIZE] = {
+	// 0 - English
+  u8"Disable achievement notifications",
+
+	// 1 - Arabic
+  u8"Disable achievement notifications",
+
+	// 2 - Bulgarian
+  u8"Disable achievement notifications",
+
+	// 3 - Simplified Chinese
+  u8"禁用成就通知",
+
+	// 4 - Traditional Chinese
+  u8"停用成就通知",
+
+	// 5 - Czech
+  u8"Zakázat oznámení o úspěších",
+
+	// 6 - Danish
+  u8"Disable achievement notifications",
+
+	// 7 - Dutch
+  u8"Disable achievement notifications",
+
+	// 8 - Finnish
+  u8"Disable achievement notifications",
+
+	// 9 - French
+  u8"Désactiver les notifications de succès",
+
+	// 10 - German
+  u8"Erfolgsbenachrichtigungen deaktivieren",
+
+	// 11 - Greek
+  u8"Disable achievement notifications",
+
+	// 12 - Hungarian
+  u8"Disable achievement notifications",
+
+	// 13 - Italian
+  u8"Disattiva le notifiche dei successi",
+
+	// 14 - Japanese
+  u8"実績通知を無効にする",
+
+	// 15 - Korean
+  u8"업적 알림 비활성화",
+
+	// 16 - Norwegian
+  u8"Disable achievement notifications",
+
+	// 17 - Polish
+  u8"Wyłącz powiadomienia o osiągnięciach",
+
+	// 18 - Portuguese
+  u8"Desativar notificações de conquistas",
+
+	// 19 - Brazilian Portuguese
+  u8"Desativar notificações de conquistas",
+
+	// 20 - Romanian
+  u8"Disable achievement notifications",
+
+	// 21 - Russian
+  u8"Отключить уведомления о достижениях",
+
+	// 22 - Spanish
+  u8"Desactivar notificaciones de logros",
+
+	// 23 - Latin American
+  u8"Desactivar notificaciones de logros",
+
+	// 24 - Swedish
+  u8"Disable achievement notifications",
+
+	// 25 - Thai
+  u8"Disable achievement notifications",
+
+	// 26 - Turkish
+  u8"Başarı bildirimlerini devre dışı bırak",
+
+	// 27 - Ukrainian
+  u8"Вимкнути повідомлення про досягнення",
+
+	// 28 - Vietnamese
+  u8"Disable achievement notifications",
+
+	// 29 - Croatian
+  u8"Onemogući obavijesti o postignućima",
+  
+  // 30 - Indonesian
+  u8"Disable achievement notifications",
+  
+};
+
+const char translationDisableFriendNotification[TRANSLATION_NUMBER_OF_LANGUAGES][TRANSLATION_BUFFER_SIZE] = {
+	// 0 - English
+  u8"Disable friend notifications",
+
+	// 1 - Arabic
+  u8"Disable friend notifications",
+
+	// 2 - Bulgarian
+  u8"Disable friend notifications",
+
+	// 3 - Simplified Chinese
+  u8"禁用好友通知",
+
+	// 4 - Traditional Chinese
+  u8"停用好友通知",
+
+	// 5 - Czech
+  u8"Zakázat oznámení od přátel",
+
+	// 6 - Danish
+  u8"Disable friend notifications",
+
+	// 7 - Dutch
+  u8"Disable friend notifications",
+
+	// 8 - Finnish
+  u8"Disable friend notifications",
+
+	// 9 - French
+  u8"Désactiver les notifications d'amis",
+
+	// 10 - German
+  u8"Freundschaftsbenachrichtigungen deaktivieren",
+
+	// 11 - Greek
+  u8"Disable friend notifications",
+
+	// 12 - Hungarian
+  u8"Disable friend notifications",
+
+	// 13 - Italian
+  u8"Disattiva le notifiche degli amici",
+
+	// 14 - Japanese
+  u8"フレンド通知を無効にする",
+
+	// 15 - Korean
+  u8"친구 알림 비활성화",
+
+	// 16 - Norwegian
+  u8"Disable friend notifications",
+
+	// 17 - Polish
+  u8"Wyłącz powiadomienia od znajomych",
+
+	// 18 - Portuguese
+  u8"Desativar notificações de amigos",
+
+	// 19 - Brazilian Portuguese
+  u8"Desativar notificações de amigos",
+
+	// 20 - Romanian
+  u8"Disable friend notifications",
+
+	// 21 - Russian
+  u8"Отключить уведомления от друзей",
+
+	// 22 - Spanish
+  u8"Desactivar notificaciones de amigos",
+
+	// 23 - Latin American
+  u8"Desactivar notificaciones de amigos",
+
+	// 24 - Swedish
+  u8"Disable friend notifications",
+
+	// 25 - Thai
+  u8"Disable friend notifications",
+
+	// 26 - Turkish
+  u8"Arkadaş bildirimlerini devre dışı bırak",
+
+	// 27 - Ukrainian
+  u8"Вимкнути повідомлення від друзів",
+
+	// 28 - Vietnamese
+  u8"Disable friend notifications",
+
+	// 29 - Croatian
+  u8"Onemogući obavijesti od prijatelja",
+  
+  // 30 - Indonesian
+  u8"Disable friend notifications",
+  
+};
+
 
 #endif // _STEAM_OVERLAY_TRANSLATIONS_H

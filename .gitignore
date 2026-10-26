@@ -11,7 +11,10 @@
 
 # SPECIFIC
 /build
-/third-party
+# ignore the contents of third-party (the submodules are tracked as gitlinks),
+# but keep the vendored libjuice sources tracked so a clean clone builds
+/third-party/*
+!/third-party/libjuice/
 
 # TOOLS
 
@@ -30,3 +33,6 @@
 /tools/migrate_gse/.py*/
 /tools/migrate_gse/.env*/
 /tools/migrate_gse/bin
+
+.codegraph
+.reasonix

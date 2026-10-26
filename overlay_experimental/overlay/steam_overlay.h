@@ -151,6 +151,9 @@ class Steam_Overlay
     char username_text[256]{};
     std::atomic<bool> save_settings = false;
 
+    bool disable_achievement_notification = false;
+    bool disable_friend_notification = false;
+
     int current_language = 0;
 
     std::string warning_message{};
@@ -170,6 +173,12 @@ class Steam_Overlay
     // (ActivateGameOverlayInviteDialog()). invite_friend() must send the invitation
     // to this specific lobby, not the last joined one
     std::atomic<uint64> invite_lobby_id{};
+
+    // Per-friend connection telemetry cache (ping + Direct/STUN/TURN) shown
+    // inline in the friend list. Refreshed from Networking at most once per
+    // second while the overlay is open.
+    std::map<uint64, FriendConnectionStats> connections_cache{};
+    std::chrono::steady_clock::time_point connections_cache_updated{};
 
     // Rate-limiting queue for achievement notifications
     struct ScheduledAchievement {
